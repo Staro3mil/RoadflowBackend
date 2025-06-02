@@ -499,7 +499,7 @@ func main() {
 
 	// CORS configuration using the default settings
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"https://683d718627b3290008b82fe3--peaceful-dragon-66b0be.netlify.app"},
+		AllowOrigins:     []string{"https://peaceful-dragon-66b0be.netlify.app/"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
