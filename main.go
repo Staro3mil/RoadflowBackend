@@ -188,6 +188,7 @@ func verifyCaptcha(token string) (bool, error) {
 		},
 	)
 	if err != nil {
+		log.Printf("Error sending reCAPTCHA verification request: %v", err)
 		return false, err
 	}
 	defer resp.Body.Close()
