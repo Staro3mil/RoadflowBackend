@@ -21,7 +21,8 @@ import (
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
+
+	//"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -50,29 +51,47 @@ type User struct {
 	CaptchaToken string `bson:"captchaToken" json:"captchaToken"`
 }
 
-func connectMongo() *mongo.Client {
-
-	// Load .env file
-	err := godotenv.Load()
+func getMongoClient() (*mongo.Client, error) {
+	if mongoClient != nil {
+		return mongoClient, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	uri := os.Getenv("MONGO_URI")
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		return nil, err
 	}
-
-	// Use your MongoDB URI.
-	mongoURI := os.Getenv("MONGO_URI")
-	clientOptions := options.Client().ApplyURI(mongoURI)
-	client, err := mongo.Connect(context.Background(), clientOptions)
-	if err != nil {
-		log.Fatal(err)
+	if err := client.Ping(ctx, nil); err != nil {
+		return nil, err
 	}
-	// Ping the database to ensure a successful connection
-	// Send a ping to confirm a successful connection
-	if err := client.Database("go_app").RunCommand(context.TODO(), bson.D{{"ping", 1}}).Err(); err != nil {
-		panic(err)
-	}
-	log.Println("Connected to MongoDB!")
-	return client
+	mongoClient = client // cache for future calls
+	return mongoClient, nil
 }
+
+// func connectMongo() *mongo.Client {
+
+// 	// Load .env file
+// 	err := godotenv.Load()
+// 	if err != nil {
+// 		log.Fatal("Error loading .env file")
+// 	}
+
+// 	// Use your MongoDB URI.
+// 	mongoURI := os.Getenv("MONGO_URI")
+// 	clientOptions := options.Client().ApplyURI(mongoURI)
+// 	client, err := mongo.Connect(context.Background(), clientOptions)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
+// 	// Ping the database to ensure a successful connection
+// 	// Send a ping to confirm a successful connection
+// 	if err := client.Database("go_app").RunCommand(context.TODO(), bson.D{{"ping", 1}}).Err(); err != nil {
+// 		panic(err)
+// 	}
+// 	log.Println("Connected to MongoDB!")
+// 	return client
+// }
 
 func initS3() {
 	// Load AWS creds & region from environment or ~/.aws/*
@@ -91,6 +110,12 @@ func initS3() {
 }
 
 func register(c *gin.Context) {
+	client, err := getMongoClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB unavailable"})
+		return
+	}
+	userCollection = client.Database("go_app").Collection("user")
 
 	var input User
 	var existingUser User
@@ -101,7 +126,7 @@ func register(c *gin.Context) {
 
 	// Insert the user document into MongoDB with a timeout context
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err := userCollection.FindOne(ctx, bson.M{"email": input.Email}).Decode(&existingUser)
+	err = userCollection.FindOne(ctx, bson.M{"email": input.Email}).Decode(&existingUser)
 	if err == nil {
 		// If no error, then a user was found.
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Email already in use"})
@@ -177,6 +202,12 @@ func verifyCaptcha(token string) (bool, error) {
 }
 
 func login(c *gin.Context) {
+	client, err := getMongoClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB unavailable"})
+		return
+	}
+	userCollection = client.Database("go_app").Collection("user")
 
 	var input User
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -188,7 +219,7 @@ func login(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var user User
-	err := userCollection.FindOne(ctx, bson.M{"email": input.Email}).Decode(&user)
+	err = userCollection.FindOne(ctx, bson.M{"email": input.Email}).Decode(&user)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
@@ -458,9 +489,9 @@ func listImages(c *gin.Context) {
 
 func main() {
 
-	mongoClient = connectMongo()
+	// mongoClient = connectMongo()
 	// Use a database named "myapp" and a collection named "users"
-	userCollection = mongoClient.Database("go_app").Collection("user")
+	// userCollection = mongoClient.Database("go_app").Collection("user")
 
 	initS3()
 
