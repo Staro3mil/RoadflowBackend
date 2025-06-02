@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"mime"
 	"net/http"
@@ -49,6 +50,16 @@ type User struct {
 	Name         string `bson:"name" json:"name"`
 	Password     string `bson:"password" json:"password"`
 	CaptchaToken string `bson:"captchaToken" json:"captchaToken"`
+}
+
+// recaptchaResponse mirrors Google’s JSON response structure.
+type recaptchaResponse struct {
+	Success     bool     `json:"success"`
+	Score       float64  `json:"score,omitempty"`
+	Action      string   `json:"action,omitempty"`
+	ChallengeTs string   `json:"challenge_ts,omitempty"`
+	Hostname    string   `json:"hostname,omitempty"`
+	ErrorCodes  []string `json:"error-codes,omitempty"`
 }
 
 func getMongoClient() (*mongo.Client, error) {
@@ -138,8 +149,8 @@ func register(c *gin.Context) {
 		return
 	}
 
-	ok, err := verifyCaptcha(input.CaptchaToken)
-	if err != nil || !ok {
+	_, err = verifyCaptcha(input.CaptchaToken)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CAPTCHA"})
 		return
 	}
@@ -179,28 +190,38 @@ func register(c *gin.Context) {
 }
 
 // verifyCaptcha sends the token to Google's v3 verify endpoint.
-func verifyCaptcha(token string) (bool, error) {
-	resp, err := http.PostForm(
-		"https://www.google.com/recaptcha/api/siteverify",
-		url.Values{
-			"secret":   {os.Getenv("RECAPTCHA_SECRET")},
-			"response": {token},
-		},
-	)
+func verifyCaptcha(token string) (*recaptchaResponse, error) {
+	// Build the form-encoded POST
+	form := url.Values{
+		"secret":   {os.Getenv("RECAPTCHA_SECRET")},
+		"response": {token},
+		// If you want, you can also pass "remoteip": {userIPString}
+	}
+	resp, err := http.PostForm("https://www.google.com/recaptcha/api/siteverify", form)
 	if err != nil {
-		log.Printf("Error sending reCAPTCHA verification request: %v", err)
-		return false, err
+		log.Printf("[reCAPTCHA] HTTP POST error: %v\n", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var body struct {
-		Success bool `json:"success"`
-		// You can also inspect "score" and "action" if you want more control
+	// Read the raw body for extra debugging (optional)
+	rawBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[reCAPTCHA] Error reading response body: %v\n", err)
+		return nil, err
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return false, err
+
+	// Unmarshal into our struct
+	var result recaptchaResponse
+	if err := json.Unmarshal(rawBody, &result); err != nil {
+		log.Printf("[reCAPTCHA] JSON unmarshal error: %v\nFull body: %s\n", err, string(rawBody))
+		return nil, err
 	}
-	return body.Success, nil
+
+	// Log the entire response so you see error codes, score, etc.
+	log.Printf("[reCAPTCHA] siteverify response: %+v\n", result)
+
+	return &result, nil
 }
 
 func login(c *gin.Context) {
@@ -226,8 +247,8 @@ func login(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
-	ok, err := verifyCaptcha(input.CaptchaToken)
-	if err != nil || !ok {
+	_, err = verifyCaptcha(input.CaptchaToken)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CAPTCHA"})
 		return
 	}
