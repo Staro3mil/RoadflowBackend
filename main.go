@@ -115,8 +115,8 @@ func initS3() {
 
 	// read bucket & region from env
 	bucketName = os.Getenv("S3_BUCKET")
-	region = os.Getenv("S3_REGION")
-	fmt.Println("S3_BUCKET:", bucketName)
+	region = os.Getenv("AWS_REGION")
+	fmt.Println("AWS:", bucketName)
 	fmt.Println("AWS_REGION:", region)
 	if bucketName == "" || region == "" {
 		log.Fatal("S3_BUCKET and AWS_REGION must be set")
