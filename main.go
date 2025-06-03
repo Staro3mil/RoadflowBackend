@@ -116,7 +116,8 @@ func initS3() {
 	// read bucket & region from env
 	bucketName = os.Getenv("S3_BUCKET")
 	region = os.Getenv("S3_REGION")
-	log.Printf("Using S3 bucket %s in region %s", bucketName, region)
+	fmt.Println("S3_BUCKET:", bucketName)
+	fmt.Println("AWS_REGION:", region)
 	if bucketName == "" || region == "" {
 		log.Fatal("S3_BUCKET and AWS_REGION must be set")
 	}
@@ -175,9 +176,6 @@ func register(c *gin.Context) {
 		"name":  input.Name,
 		"exp":   time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
-
-	fmt.Println("The token is")
-	fmt.Println(token)
 
 	// Sign and get the complete encoded token as a string
 	tokenString, err := token.SignedString([]byte(secretKey))
@@ -277,9 +275,6 @@ func login(c *gin.Context) {
 		return
 	}
 
-	fmt.Println("The token string is")
-	fmt.Println(tokenString)
-
 	// Return a personalized greeting after successful login.
 	c.JSON(http.StatusOK, gin.H{"message": "Hello " + user.Name, "token": tokenString})
 }
@@ -314,7 +309,6 @@ func authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		fmt.Println("We got through the Middleware")
 		c.Next() // Proceed to the next handler if authorized
 	}
 }
