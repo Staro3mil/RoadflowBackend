@@ -22,6 +22,7 @@ import (
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 
 	//"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
@@ -510,14 +511,16 @@ func main() {
 	// mongoClient = connectMongo()
 	// Use a database named "myapp" and a collection named "users"
 	// userCollection = mongoClient.Database("go_app").Collection("user")
-
+	if err := godotenv.Load(); err != nil {
+		log.Println(".env file not found – make sure AWS_REGION and S3_BUCKET are set in your environment")
+	}
 	initS3()
 
 	r := gin.Default()
 
 	// CORS configuration using the default settings
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"https://peaceful-dragon-66b0be.netlify.app"},
+		AllowOrigins:     []string{"http://localhost:8081", "https://peaceful-dragon-66b0be.netlify.app"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
