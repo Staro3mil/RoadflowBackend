@@ -50,7 +50,8 @@ type User struct {
 	Email        string `bson:"email" json:"email"`
 	Name         string `bson:"name" json:"name"`
 	Password     string `bson:"password" json:"password"`
-	CaptchaToken string `bson:"captchaToken" json:"captchaToken"`
+	CaptchaToken string `bson:"-" json:"captchaToken"`
+	Role         string `bson:"role" json:"role"` // e.g. "admin", "user"
 }
 
 // recaptchaResponse mirrors Google’s JSON response structure.
@@ -165,6 +166,7 @@ func register(c *gin.Context) {
 	}
 	input.Password = string(hashedPassword)
 
+	input.Role = "user"
 	defer cancel()
 	_, err = userCollection.InsertOne(ctx, input)
 	if err != nil {
@@ -175,6 +177,7 @@ func register(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"email": input.Email,
 		"name":  input.Name,
+		"role":  input.Role,
 		"exp":   time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
 
@@ -263,6 +266,7 @@ func login(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"email": user.Email,
 		"name":  user.Name,
+		"role":  user.Role,
 		"exp":   time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
 
@@ -311,6 +315,22 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 		c.Next() // Proceed to the next handler if authorized
+	}
+}
+
+func adminOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claimsI, exists := c.Get("claims")
+		if !exists {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		claims := claimsI.(jwt.MapClaims)
+		if claims["role"] != "admin" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "admin access required"})
+			return
+		}
+		c.Next()
 	}
 }
 
@@ -441,33 +461,64 @@ func listIntersections(c *gin.Context) {
 	c.JSON(200, intersections)
 }
 
-// listImages handler
-// func listImages(c *gin.Context) {
-// 	ix := c.Param("ix")
-// 	claimsI, _ := c.Get("claims")
-// 	claims := claimsI.(jwt.MapClaims)
-// 	user := claims["name"].(string)
+// listUsersHandler returns all user docs (minus passwords!)
+func listUsersHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-// 	prefix := fmt.Sprintf("%s/%s/", user, ix)
-// 	out, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
-// 		Bucket: aws.String(bucketName),
-// 		Prefix: aws.String(prefix),
-// 	})
-// 	if err != nil {
-// 		c.JSON(500, gin.H{"errorlistImages": err.Error()})
-// 		return
-// 	}
+	cursor, err := userCollection.Find(ctx, bson.M{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot list users"})
+		return
+	}
+	defer cursor.Close(ctx)
 
-// 	// Build public URLs (assuming ACL public-read)
-// 	base := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/", bucketName, region)
-// 	urls := []string{}
-// 	for _, obj := range out.Contents {
-// 		if strings.HasSuffix(*obj.Key, ".png") {
-// 			urls = append(urls, base+*obj.Key)
-// 		}
-// 	}
-// 	c.JSON(200, urls)
-// }
+	var users []User
+	for cursor.Next(ctx) {
+		var u User
+		cursor.Decode(&u)
+		u.Password = "" // never send back hash
+		users = append(users, u)
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+// updateUserHandler lets an admin change another user's data
+func updateUserHandler(c *gin.Context) {
+	email := c.Param("email")
+	var payload struct {
+		Name string `json:"name,omitempty"`
+		Role string `json:"role,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	update := bson.M{}
+	if payload.Name != "" {
+		update["name"] = payload.Name
+	}
+	if payload.Role != "" {
+		update["role"] = payload.Role
+	}
+	if len(update) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "nothing to update"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := userCollection.UpdateOne(ctx,
+		bson.M{"email": email},
+		bson.M{"$set": update},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "user updated"})
+}
 
 func listImages(c *gin.Context) {
 	ix := c.Param("ix")
@@ -545,6 +596,11 @@ func main() {
 
 	// List images in one intersection
 	authorized.GET("/intersections/:ix/images", listImages)
+
+	admin := authorized.Group("/")
+	admin.Use(adminOnly())
+	admin.GET("/users", listUsersHandler)
+	admin.PUT("/users/:email", updateUserHandler)
 	r.POST("/upload", uploadHandler)
 
 	r.Run(":8080")
