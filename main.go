@@ -1178,6 +1178,45 @@ func deleteMyRecording(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Recording deleted successfully"})
 }
 
+// Generate simulation token for admin to simulate another user
+func generateSimulationToken(c *gin.Context) {
+	email := c.Param("email")
+
+	// Get the user to simulate
+	var user User
+	err := userCollection.FindOne(context.TODO(), bson.M{"email": email}).Decode(&user)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	// Create simulation token with special role
+	claims := jwt.MapClaims{
+		"email":          user.Email,
+		"name":           user.Name,
+		"role":           user.Role,
+		"simulation":     true,
+		"original_admin": c.GetString("email"), // Store the original admin email
+		"exp":            time.Now().Add(time.Hour * 24).Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(secretKey))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"token": tokenString,
+		"user": gin.H{
+			"email": user.Email,
+			"name":  user.Name,
+			"role":  user.Role,
+		},
+	})
+}
+
 func main() {
 
 	// mongoClient = connectMongo()
@@ -1218,6 +1257,7 @@ func main() {
 		authorized.POST("/users/me/recordings/rename", renameMyRecording) // New
 		authorized.DELETE("/users/me/recordings", deleteMyRecording)      // New
 		authorized.POST("/upload", uploadHandler)
+
 		// Admin routes
 		admin := authorized.Group("/")
 		admin.Use(adminOnly())
@@ -1227,6 +1267,7 @@ func main() {
 			admin.DELETE("/users/:email", deleteUserHandler)
 			admin.GET("/users/:email/recordings", listUserRecordings)
 			admin.DELETE("/recordings/:key", deleteRecording)
+			admin.POST("/simulate/:email", generateSimulationToken)
 		}
 	}
 
