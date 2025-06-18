@@ -88,30 +88,6 @@ func getMongoClient() (*mongo.Client, error) {
 	return mongoClient, nil
 }
 
-// func connectMongo() *mongo.Client {
-
-// 	// Load .env file
-// 	err := godotenv.Load()
-// 	if err != nil {
-// 		log.Fatal("Error loading .env file")
-// 	}
-
-// 	// Use your MongoDB URI.
-// 	mongoURI := os.Getenv("MONGO_URI")
-// 	clientOptions := options.Client().ApplyURI(mongoURI)
-// 	client, err := mongo.Connect(context.Background(), clientOptions)
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	// Ping the database to ensure a successful connection
-// 	// Send a ping to confirm a successful connection
-// 	if err := client.Database("go_app").RunCommand(context.TODO(), bson.D{{"ping", 1}}).Err(); err != nil {
-// 		panic(err)
-// 	}
-// 	log.Println("Connected to MongoDB!")
-// 	return client
-// }
-
 func initS3() {
 	// Load AWS creds & region from environment or ~/.aws/*
 	cfg, err := config.LoadDefaultConfig(context.TODO())
@@ -903,6 +879,16 @@ type RecordingDetail struct {
 	Duration     int64      `json:"duration"` // in seconds, 0 if not available for now
 }
 
+type VideoDetail struct {
+	ID           string    `json:"id"`
+	Filename     string    `json:"filename"`
+	S3URL        string    `json:"s3Url"`
+	UploadDate   time.Time `json:"uploadDate"`
+	FileSize     int64     `json:"fileSize"`
+	Duration     int64     `json:"duration"`
+	ThumbnailURL string    `json:"thumbnailUrl,omitempty"`
+}
+
 func listMyRecordings(c *gin.Context) {
 	// Get the current user from the JWT claims
 	claimsI, exists := c.Get("claims")
@@ -1009,6 +995,117 @@ func listMyRecordings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, recordingsDetails)
+}
+
+func listUserVideos(c *gin.Context) {
+	// Get the current user from the JWT claims
+	claimsI, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "claims not found in context"})
+		return
+	}
+
+	claims, ok := claimsI.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid claims data"})
+		return
+	}
+
+	userName, ok := claims["name"].(string)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user name not found in claims"})
+		return
+	}
+
+	ctx := context.TODO()
+	userRecordingsPrefix := userName + "/recordings/"
+
+	// List all objects in the user's recordings folder
+	output, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(userRecordingsPrefix),
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list videos"})
+		return
+	}
+
+	// Generate pre-signed URLs for each video
+	presigner := s3.NewPresignClient(s3Client)
+	var videoDetails []VideoDetail
+
+	for _, obj := range output.Contents {
+		// Skip "folders"
+		if strings.HasSuffix(*obj.Key, "/") {
+			continue
+		}
+
+		// Generate a pre-signed URL for the video (valid for 1 hour for YOLO processing)
+		req, err := presigner.PresignGetObject(c.Request.Context(), &s3.GetObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    obj.Key,
+		}, s3.WithPresignExpires(1*time.Hour))
+
+		if err != nil {
+			log.Printf("Failed to presign video object %s: %v", *obj.Key, err)
+			continue
+		}
+
+		objectName := strings.TrimPrefix(*obj.Key, userRecordingsPrefix)
+
+		// Attempt to generate pre-signed URL for thumbnail
+		thumbnailKey := getThumbnailKey(*obj.Key)
+		var thumbnailURL string
+		if thumbnailKey != "" {
+			thumbReq, err := presigner.PresignGetObject(c.Request.Context(), &s3.GetObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(thumbnailKey),
+			}, s3.WithPresignExpires(1*time.Hour))
+
+			if err == nil {
+				thumbnailURL = thumbReq.URL
+			} else {
+				// Log if thumbnail presign fails, but don't stop processing
+				var nsk *types.NoSuchKey
+				if !errors.As(err, &nsk) {
+					log.Printf("Failed to presign thumbnail object %s: %v", thumbnailKey, err)
+				}
+			}
+		}
+
+		var actualSize int64
+		if obj.Size != nil {
+			actualSize = *obj.Size
+		}
+
+		// Extract duration from S3 metadata
+		var duration int64
+		headOutput, err := s3Client.HeadObject(c.Request.Context(), &s3.HeadObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    obj.Key,
+		})
+		if err == nil && headOutput.Metadata != nil {
+			if durationStr, exists := headOutput.Metadata["duration"]; exists {
+				if parsedDuration, parseErr := strconv.ParseFloat(durationStr, 64); parseErr == nil {
+					duration = int64(parsedDuration)
+				}
+			}
+		}
+
+		// Create video detail with ID as the object key
+		videoDetails = append(videoDetails, VideoDetail{
+			ID:           *obj.Key,
+			Filename:     objectName,
+			S3URL:        req.URL,
+			UploadDate:   *obj.LastModified,
+			FileSize:     actualSize,
+			Duration:     duration,
+			ThumbnailURL: thumbnailURL,
+		})
+	}
+
+	c.JSON(http.StatusOK, videoDetails)
 }
 
 type RenameRecordingRequest struct {
@@ -1217,8 +1314,176 @@ func generateSimulationToken(c *gin.Context) {
 	})
 }
 
-func main() {
+// detectLocationHandler handles location detection requests from uploaded videos
+func detectLocationHandler(c *gin.Context) {
+	// Get the request data
+	var req struct {
+		VideoURL string `json:"video_url" binding:"required"`
+		VideoKey string `json:"video_key" binding:"required"`
+		Filename string `json:"filename" binding:"required"`
+	}
 
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+
+	// Get user name from JWT claims
+	claimsI, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	tokenClaims := claimsI.(jwt.MapClaims)
+	userName, ok := tokenClaims["name"].(string)
+	if !ok || userName == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User name not found in claims"})
+		return
+	}
+	// Download the video from S3 directly instead of using HTTP GET
+	s3Key := req.VideoKey
+	if s3Key == "" {
+		// If no video_key provided, try to extract from video_url
+		// Assuming video_url is in format: https://bucket.s3.amazonaws.com/key
+		// Extract the key part after the bucket name
+		if strings.Contains(req.VideoURL, ".s3.amazonaws.com/") {
+			parts := strings.Split(req.VideoURL, ".s3.amazonaws.com/")
+			if len(parts) > 1 {
+				s3Key = parts[1]
+			}
+		}
+	}
+
+	if s3Key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Could not determine S3 key for video"})
+		return
+	}
+
+	// Download video from S3 using the AWS SDK
+	getObjectInput := &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(s3Key),
+	}
+
+	resp, err := s3Client.GetObject(context.TODO(), getObjectInput)
+	if err != nil {
+		log.Printf("Failed to get object from S3: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to access video from S3: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Save video to temporary file
+	tmpVid, err := ioutil.TempFile("", "location-detect-*.mp4")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Server error"})
+		return
+	}
+	defer os.Remove(tmpVid.Name())
+	defer tmpVid.Close()
+
+	if _, err := io.Copy(tmpVid, resp.Body); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process video"})
+		return
+	}
+	tmpVid.Close()
+
+	// Perform location detection
+	result := ExtractFrameAndDetectLocation(tmpVid.Name(), userName, req.Filename)
+
+	// If location was detected, optionally save it to video metadata
+	if result.Success && result.Location != nil {
+		// Update video metadata in S3 with detected location
+		err := updateVideoMetadata(req.VideoKey, map[string]string{
+			"detected-address":    result.Location.Address,
+			"detected-latitude":   fmt.Sprintf("%.6f", result.Location.Latitude),
+			"detected-longitude":  fmt.Sprintf("%.6f", result.Location.Longitude),
+			"detected-confidence": fmt.Sprintf("%.2f", result.Location.Confidence),
+			"detected-source":     result.Location.Source,
+			"detected-timestamp":  time.Now().UTC().Format(time.RFC3339),
+		})
+
+		if err != nil {
+			log.Printf("Failed to update video metadata: %v", err)
+			// Don't fail the request, just log the error
+		}
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// updateVideoMetadata updates the metadata of a video in S3
+func updateVideoMetadata(s3Key string, metadata map[string]string) error {
+	// Copy the object to itself with new metadata
+	copySource := bucketName + "/" + s3Key
+
+	_, err := s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+		Bucket:            aws.String(bucketName),
+		Key:               aws.String(s3Key),
+		CopySource:        aws.String(copySource),
+		Metadata:          metadata,
+		MetadataDirective: "REPLACE",
+	})
+
+	return err
+}
+
+// saveVideoLocationHandler handles saving user-confirmed location data for videos
+func saveVideoLocationHandler(c *gin.Context) {
+	var req struct {
+		VideoKey string          `json:"video_key" binding:"required"`
+		Location *LocationResult `json:"location" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+
+	// Get user name from JWT claims for security
+	claimsI, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	tokenClaims := claimsI.(jwt.MapClaims)
+	userName, ok := tokenClaims["name"].(string)
+	if !ok || userName == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User name not found in claims"})
+		return
+	}
+
+	// Verify that the video key belongs to the user
+	if !strings.HasPrefix(req.VideoKey, userName+"/") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied to this video"})
+		return
+	}
+
+	// Update video metadata with user-confirmed location
+	metadata := map[string]string{
+		"confirmed-address":    req.Location.Address,
+		"confirmed-latitude":   fmt.Sprintf("%.6f", req.Location.Latitude),
+		"confirmed-longitude":  fmt.Sprintf("%.6f", req.Location.Longitude),
+		"confirmed-confidence": fmt.Sprintf("%.2f", req.Location.Confidence),
+		"confirmed-source":     req.Location.Source,
+		"confirmed-timestamp":  time.Now().UTC().Format(time.RFC3339),
+		"location-status":      "confirmed",
+	}
+
+	err := updateVideoMetadata(req.VideoKey, metadata)
+	if err != nil {
+		log.Printf("Failed to save video location: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save location"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Location saved successfully",
+		"location": req.Location,
+	})
+}
+
+func main() {
 	// mongoClient = connectMongo()
 	// Use a database named "myapp" and a collection named "users"
 	// userCollection = mongoClient.Database("go_app").Collection("user")
@@ -1226,6 +1491,7 @@ func main() {
 		log.Println(".env file not found – make sure AWS_REGION and S3_BUCKET are set in your environment")
 	}
 	initS3()
+	initYOLOBackend()
 
 	r := gin.Default()
 
@@ -1246,7 +1512,6 @@ func main() {
 		"https://elf-wanted-mullet.ngrok-free.app/files/aaa.txt",
 		"aaa.txt",
 	))
-
 	// Protected routes: only accessible with a valid token.
 	authorized := r.Group("/")
 	authorized.Use(authMiddleware())
@@ -1254,9 +1519,17 @@ func main() {
 		authorized.GET("/landing", landingHandler)
 		authorized.GET("/intersections", listIntersections)
 		authorized.GET("/users/me/recordings", listMyRecordings)          // Existing
+		authorized.GET("/user-videos", listUserVideos)                    // New endpoint for analyze videos
 		authorized.POST("/users/me/recordings/rename", renameMyRecording) // New
 		authorized.DELETE("/users/me/recordings", deleteMyRecording)      // New
-		authorized.POST("/upload", uploadHandler)
+		authorized.POST("/upload", uploadHandler)                         // YOLO proxy routes
+		authorized.POST("/detect-location", detectLocationHandler)        // Location detection endpoint
+		authorized.POST("/save-video-location", saveVideoLocationHandler) // Save video location endpoint
+		// YOLO proxy routes
+		authorized.POST("/yolo/upload", uploadVideoToYOLO)
+		authorized.POST("/yolo/process", processVideoWithYOLO)
+		authorized.GET("/yolo/status/:task_id", getYOLOTaskStatus)
+		authorized.GET("/yolo/download/:file_id", downloadYOLOResults)
 
 		// Admin routes
 		admin := authorized.Group("/")
