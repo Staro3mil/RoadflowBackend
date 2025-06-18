@@ -170,12 +170,12 @@ func register(c *gin.Context) {
 			log.Printf("Failed to create S3 folder %s: %v", folder, err)
 		}
 	}
-
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"email": input.Email,
-		"name":  input.Name,
-		"role":  input.Role,
-		"exp":   time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
+		"email":  input.Email,
+		"name":   input.Name,
+		"role":   input.Role,
+		"status": input.Status, // Add status to token claims
+		"exp":    time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
 
 	// Sign and get the complete encoded token as a string
@@ -252,19 +252,24 @@ func login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CAPTCHA"})
 		return
 	}
-
 	// Compare the provided password with the hashed password stored in MongoDB
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
+	// Check if user is suspended
+	if user.Status == "suspended" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Account suspended. Please contact administrator."})
+		return
+	}
 	// Create a new token object, specifying signing method and the claims
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"email": user.Email,
-		"name":  user.Name,
-		"role":  user.Role,
-		"exp":   time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
+		"email":  user.Email,
+		"name":   user.Name,
+		"role":   user.Role,
+		"status": user.Status, // Add status to token claims
+		"exp":    time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
 
 	fmt.Println("The token is")
@@ -309,9 +314,14 @@ func authMiddleware() gin.HandlerFunc {
 			c.Abort() // Stop further processing if unauthorized
 			return
 		}
-
 		// Set the token claims to the context
 		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+			// Check if user is suspended
+			if status, exists := claims["status"]; exists && status == "suspended" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Account suspended. Please contact administrator."})
+				c.Abort()
+				return
+			}
 			c.Set("claims", claims)
 		} else {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized Claim"})
