@@ -174,7 +174,7 @@ func register(c *gin.Context) {
 		"email":  input.Email,
 		"name":   input.Name,
 		"role":   input.Role,
-		"status": input.Status, // Add status to token claims
+		"status": input.Status,                         // Add status to token claims
 		"exp":    time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
 
@@ -268,7 +268,7 @@ func login(c *gin.Context) {
 		"email":  user.Email,
 		"name":   user.Name,
 		"role":   user.Role,
-		"status": user.Status, // Add status to token claims
+		"status": user.Status,                          // Add status to token claims
 		"exp":    time.Now().Add(time.Hour * 2).Unix(), // Token expiration time
 	})
 
@@ -552,6 +552,15 @@ func makeDownloadProxy(remoteURL, localFilename string) gin.HandlerFunc {
 	}
 }
 
+// IntersectionInfo represents the intersection data with metadata
+type IntersectionInfo struct {
+	Name           string   `json:"name"`
+	ID             string   `json:"id,omitempty"`
+	DirectionCodes []string `json:"direction_codes,omitempty"`
+	DirectionCount string   `json:"direction_count,omitempty"`
+	PhaseCount     string   `json:"phase_count,omitempty"`
+}
+
 // listIntersections handler
 func listIntersections(c *gin.Context) {
 	// 1) get user folder name from JWT claims
@@ -570,14 +579,52 @@ func listIntersections(c *gin.Context) {
 		return
 	}
 
-	// 3) collect the CommonPrefixes (each is user/intersections/IntersectionX/)
-	var intersections []string
+	// 3) collect intersection information with metadata
+	var intersections []IntersectionInfo
 	for _, cp := range out.CommonPrefixes {
 		// trim trailing slash and user/intersections/ prefix:
 		folder := strings.TrimSuffix(*cp.Prefix, "/")
 		parts := strings.Split(folder, "/")
 		if len(parts) > 2 {
-			intersections = append(intersections, parts[len(parts)-1])
+			intersectionName := parts[len(parts)-1]
+
+			// Try to get metadata from config.json
+			configKey := fmt.Sprintf("%s/intersections/%s/config.json", user, intersectionName)
+
+			intersection := IntersectionInfo{
+				Name: intersectionName,
+			}
+
+			// Attempt to get object metadata
+			headOutput, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(configKey),
+			})
+
+			if err != nil {
+				log.Printf("Error getting metadata for %s: %v", intersectionName, err)
+			} else if headOutput.Metadata == nil {
+				log.Printf("No metadata found for %s", intersectionName)
+			} else {
+				log.Printf("Found metadata for %s: %+v", intersectionName, headOutput.Metadata)
+				// Extract metadata if available
+				if id, exists := headOutput.Metadata["intersection_id"]; exists {
+					intersection.ID = id
+					log.Printf("Set intersection ID: %s", id)
+				}
+				if dirCodes, exists := headOutput.Metadata["direction_codes"]; exists && dirCodes != "" {
+					intersection.DirectionCodes = strings.Split(dirCodes, ",")
+					log.Printf("Set direction codes: %v", intersection.DirectionCodes)
+				}
+				if dirCount, exists := headOutput.Metadata["direction_count"]; exists {
+					intersection.DirectionCount = dirCount
+				}
+				if phaseCount, exists := headOutput.Metadata["phase_count"]; exists {
+					intersection.PhaseCount = phaseCount
+				}
+			}
+
+			intersections = append(intersections, intersection)
 		}
 	}
 
@@ -1528,13 +1575,15 @@ func main() {
 	{
 		authorized.GET("/landing", landingHandler)
 		authorized.GET("/intersections", listIntersections)
-		authorized.GET("/users/me/recordings", listMyRecordings)          // Existing
-		authorized.GET("/user-videos", listUserVideos)                    // New endpoint for analyze videos
-		authorized.POST("/users/me/recordings/rename", renameMyRecording) // New
-		authorized.DELETE("/users/me/recordings", deleteMyRecording)      // New
-		authorized.POST("/upload", uploadHandler)                         // YOLO proxy routes
-		authorized.POST("/detect-location", detectLocationHandler)        // Location detection endpoint
-		authorized.POST("/save-video-location", saveVideoLocationHandler) // Save video location endpoint
+		authorized.POST("/simulate-intersection", createIntersectionHandler) // New intersection creation endpoint
+		authorized.DELETE("/intersections/:name", deleteIntersectionHandler) // Delete intersection endpoint
+		authorized.GET("/users/me/recordings", listMyRecordings)             // Existing
+		authorized.GET("/user-videos", listUserVideos)                       // New endpoint for analyze videos
+		authorized.POST("/users/me/recordings/rename", renameMyRecording)    // New
+		authorized.DELETE("/users/me/recordings", deleteMyRecording)         // New
+		authorized.POST("/upload", uploadHandler)                            // YOLO proxy routes
+		authorized.POST("/detect-location", detectLocationHandler)           // Location detection endpoint
+		authorized.POST("/save-video-location", saveVideoLocationHandler)    // Save video location endpoint
 		// YOLO proxy routes
 		authorized.POST("/yolo/upload", uploadVideoToYOLO)
 		authorized.POST("/yolo/process", processVideoWithYOLO)
