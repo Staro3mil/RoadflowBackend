@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -153,23 +154,37 @@ func register(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not register user"})
 		return
-	} // Create S3 folders for the new user
+	} // Create S3 folders for the new user asynchronously
 	userFolder := input.Name + "/"
 	recordingsFolder := userFolder + "recordings/"
 	thumbnailsFolder := userFolder + "thumbnails/"
 	intersectionsFolder := userFolder + "intersections/"
+	// Create S3 folders in parallel using goroutines - don't block user registration
+	go func() {
+		var wg sync.WaitGroup
+		folders := []string{recordingsFolder, thumbnailsFolder, intersectionsFolder}
 
-	// S3 does not have real folders, so we upload empty objects with trailing slashes
-	for _, folder := range []string{recordingsFolder, thumbnailsFolder, intersectionsFolder} {
-		_, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(folder),
-			Body:   strings.NewReader(""), // empty body
-		})
-		if err != nil {
-			log.Printf("Failed to create S3 folder %s: %v", folder, err)
+		for _, folder := range folders {
+			wg.Add(1)
+			go func(folderPath string) {
+				defer wg.Done()
+				_, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String(folderPath),
+					Body:   strings.NewReader(""), // empty body
+				})
+				if err != nil {
+					log.Printf("Failed to create S3 folder %s: %v", folderPath, err)
+				} else {
+					log.Printf("Successfully created S3 folder: %s", folderPath)
+				}
+			}(folder)
 		}
-	}
+
+		// Wait for all folder creation goroutines to complete
+		wg.Wait()
+		log.Printf("All S3 folders created for user: %s", input.Name)
+	}()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"email":  input.Email,
 		"name":   input.Name,
@@ -405,7 +420,7 @@ func uploadHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Server error"})
 		return
 	}
-	defer os.Remove(tmpVid.Name())
+	// Don't defer cleanup here - let the thumbnail goroutine handle it
 	if _, err := io.Copy(tmpVid, file); err != nil {
 		log.Printf("tempfile write error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Server error"})
@@ -452,62 +467,75 @@ func uploadHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Upload to S3 failed"})
 		return
 	}
+	// Generate thumbnail asynchronously - don't block the upload response
+	go func() { // Small delay to ensure the main function has completed
+		time.Sleep(100 * time.Millisecond)
 
-	// build a unique temp path
-	thumbPath := filepath.Join(os.TempDir(),
-		fmt.Sprintf("thumb-%d.jpg", time.Now().UnixNano()),
-	)
-
-	// run ffmpeg: -y to overwrite, grab 1 frame at 1s, scale to 320px wide
-	cmd := exec.Command(
-		"ffmpeg", "-y",
-		"-i", tmpVid.Name(),
-		"-ss", "00:00:01",
-		"-vframes", "1",
-		"-vf", "scale=320:-1",
-		thumbPath,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// ffmpeg failed—log stderr so you can debug
-		log.Printf("ffmpeg thumbnail error: %v\n%s", err, out)
-	} else {
-		// check that the file actually exists and is non-zero
-		if fi, statErr := os.Stat(thumbPath); statErr == nil && fi.Size() > 0 {
-			// upload to S3 under `<userName>/recordings/thumbnails/<filename>.thumbnail.jpg`
-			thumbFile, openErr := os.Open(thumbPath)
-			if openErr != nil {
-				log.Printf("opening thumbnail failed: %v", openErr)
-			} else {
-				defer thumbFile.Close() // Extract just the filename without path from the original S3 key
-				originalFilename := strings.TrimPrefix(s3Key, userName+"/recordings/")
-				thumbnailS3Key := userName + "/thumbnails/" + originalFilename + ".thumbnail.jpg"
-
-				if _, upErr := manager.
-					NewUploader(s3Client).
-					Upload(context.TODO(), &s3.PutObjectInput{
-						Bucket:      aws.String(bucketName),
-						Key:         aws.String(thumbnailS3Key),
-						Body:        thumbFile,
-						ContentType: aws.String("image/jpeg"),
-					}); upErr != nil {
-					log.Printf("thumbnail upload failed: %v", upErr)
-				} else {
-					log.Printf("thumbnail uploaded: %s", thumbnailS3Key)
-				}
-			}
-		} else {
-			log.Printf("thumbnail not created or zero size: %v", statErr)
+		// Verify the temporary video file still exists
+		if _, err := os.Stat(tmpVid.Name()); os.IsNotExist(err) {
+			log.Printf("Temporary video file no longer exists: %s", tmpVid.Name())
+			return
 		}
-	}
-	// remove the temp JPEG in any case
-	os.Remove(thumbPath)
+
+		// build a unique temp path
+		thumbPath := filepath.Join(os.TempDir(),
+			fmt.Sprintf("thumb-%d.jpg", time.Now().UnixNano()),
+		)
+
+		// run ffmpeg: -y to overwrite, grab 1 frame at 1s, scale to 320px wide
+		cmd := exec.Command(
+			"ffmpeg", "-y",
+			"-i", tmpVid.Name(),
+			"-ss", "00:00:01",
+			"-vframes", "1",
+			"-vf", "scale=320:-1",
+			thumbPath,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			// ffmpeg failed—log stderr so you can debug
+			log.Printf("ffmpeg thumbnail error: %v\n%s", err, out)
+		} else {
+			// check that the file actually exists and is non-zero
+			if fi, statErr := os.Stat(thumbPath); statErr == nil && fi.Size() > 0 {
+				// upload to S3 under `<userName>/recordings/thumbnails/<filename>.thumbnail.jpg`
+				thumbFile, openErr := os.Open(thumbPath)
+				if openErr != nil {
+					log.Printf("opening thumbnail failed: %v", openErr)
+				} else {
+					defer thumbFile.Close() // Extract just the filename without path from the original S3 key
+					originalFilename := strings.TrimPrefix(s3Key, userName+"/recordings/")
+					thumbnailS3Key := userName + "/thumbnails/" + originalFilename + ".thumbnail.jpg"
+
+					if _, upErr := manager.
+						NewUploader(s3Client).
+						Upload(context.TODO(), &s3.PutObjectInput{
+							Bucket:      aws.String(bucketName),
+							Key:         aws.String(thumbnailS3Key),
+							Body:        thumbFile,
+							ContentType: aws.String("image/jpeg"),
+						}); upErr != nil {
+						log.Printf("thumbnail upload failed: %v", upErr)
+					} else {
+						log.Printf("thumbnail uploaded: %s", thumbnailS3Key)
+					}
+				}
+			} else {
+				log.Printf("thumbnail not created or zero size: %v", statErr)
+			}
+		}
+		// remove the temp JPEG in any case
+		os.Remove(thumbPath)
+
+		// Clean up the temporary video file
+		os.Remove(tmpVid.Name())
+	}()
 
 	// ==== end thumbnail section ====
 
-	// finally, respond to the client
+	// Respond to the client immediately without waiting for thumbnail generation
 	c.JSON(http.StatusOK, gin.H{
-		"message":  "File (and thumbnail) uploaded successfully",
+		"message":  "File uploaded successfully, thumbnail generation in progress",
 		"location": result.Location,
 	})
 }
@@ -1054,6 +1082,72 @@ func listMyRecordings(c *gin.Context) {
 	c.JSON(http.StatusOK, recordingsDetails)
 }
 
+// Download recording by key - used by Flask analysis app (public endpoint)
+func downloadRecording(c *gin.Context) {
+	// Get the recording key from URL parameter
+	recordingKey := c.Param("key")
+	if recordingKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "recording key is required"})
+		return
+	}
+
+	// Remove the leading slash from wildcard parameter
+	if strings.HasPrefix(recordingKey, "/") {
+		recordingKey = recordingKey[1:]
+	}
+
+	// Extract username from the key (format: username/recordings/filename)
+	parts := strings.Split(recordingKey, "/")
+	if len(parts) < 3 || parts[1] != "recordings" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid recording key format"})
+		return
+	}
+
+	userName := parts[0]
+	log.Printf("Public download request for user: %s, key: %s", userName, recordingKey)
+
+	// Verify that the key has the correct format (security check)
+	userRecordingsPrefix := userName + "/recordings/"
+	if !strings.HasPrefix(recordingKey, userRecordingsPrefix) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied to this recording"})
+		return
+	}
+
+	// Download the object from S3
+	getObjectInput := &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(recordingKey),
+	}
+
+	result, err := s3Client.GetObject(c.Request.Context(), getObjectInput)
+	if err != nil {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "recording not found"})
+		} else {
+			log.Printf("Failed to get object %s: %v", recordingKey, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to download recording"})
+		}
+		return
+	}
+	defer result.Body.Close()
+
+	// Get the filename from the key
+	filename := filepath.Base(recordingKey)
+
+	// Set appropriate headers for video download
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+
+	// Copy the S3 object data to the response
+	_, err = io.Copy(c.Writer, result.Body)
+	if err != nil {
+		log.Printf("Failed to copy object data: %v", err)
+		// Note: At this point headers are already sent, so we can't send a JSON error
+		return
+	}
+}
+
 func listUserVideos(c *gin.Context) {
 	// Get the current user from the JWT claims
 	claimsI, exists := c.Get("claims")
@@ -1551,10 +1645,14 @@ func main() {
 	initYOLOBackend()
 
 	r := gin.Default()
-
 	// CORS configuration using the default settings
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:8081", "https://peaceful-dragon-66b0be.netlify.app"},
+		AllowOrigins: []string{
+			"http://localhost:8081",
+			"http://localhost:5000",
+			"https://peaceful-dragon-66b0be.netlify.app",
+			"https://processingflaskapp-49638678323.europe-central2.run.app",
+		},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -1567,8 +1665,10 @@ func main() {
 	r.POST("/login", login)
 	r.GET("/api", makeDownloadProxy(
 		"https://elf-wanted-mullet.ngrok-free.app/files/aaa.txt",
-		"aaa.txt",
-	))
+		"aaa.txt"))
+	// Public download route for Flask analysis app
+	r.GET("/recordings/*key", downloadRecording)
+
 	// Protected routes: only accessible with a valid token.
 	authorized := r.Group("/")
 	authorized.Use(authMiddleware())

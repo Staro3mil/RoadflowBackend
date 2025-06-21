@@ -266,7 +266,7 @@ func tryGoogleVisionAPIWithData(imageData []byte) *LocationResult {
 	}
 
 	// Log the full response for debugging
-	log.Printf("Google Vision API response: %s", string(body))
+	//log.Printf("Google Vision API response: %s", string(body))
 
 	// Process landmark annotations first (most reliable)
 	if len(visionResponse.Responses) > 0 {
