@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +16,34 @@ import (
 
 // YOLO backend URL - will be initialized in main.go
 var yoloBackendURL string
+
+// Task management structures for async processing
+type TaskStatus struct {
+	ID          string                 `json:"id"`
+	Status      string                 `json:"status"` // "pending", "processing", "completed", "failed"
+	Progress    int                    `json:"progress"`
+	Result      map[string]interface{} `json:"result,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+	CompletedAt *time.Time             `json:"completed_at,omitempty"`
+}
+
+// Global task storage with mutex for thread safety
+var (
+	tasks      = make(map[string]*TaskStatus)
+	tasksMutex = sync.RWMutex{}
+)
+
+// Channels for task communication
+type TaskUpdate struct {
+	TaskID   string
+	Status   string
+	Progress int
+	Result   map[string]interface{}
+	Error    string
+}
+
+var taskUpdates = make(chan TaskUpdate, 100)
 
 // Request structures for YOLO proxy
 type YOLOUploadRequest struct {
@@ -99,7 +128,7 @@ func uploadVideoToYOLO(c *gin.Context) {
 	c.JSON(yoloResp.StatusCode, result)
 }
 
-// processVideoWithYOLO handles the proxy request to start video processing
+// processVideoWithYOLO handles the proxy request to start video processing asynchronously
 func processVideoWithYOLO(c *gin.Context) {
 	var req YOLOProcessRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -107,68 +136,213 @@ func processVideoWithYOLO(c *gin.Context) {
 		return
 	}
 
+	// Generate unique task ID
+	taskID := fmt.Sprintf("task_%d_%s", time.Now().Unix(), req.FileID)
+
+	// Create initial task status
+	task := &TaskStatus{
+		ID:        taskID,
+		Status:    "pending",
+		Progress:  0,
+		CreatedAt: time.Now(),
+	}
+
+	// Store task in memory (thread-safe)
+	tasksMutex.Lock()
+	tasks[taskID] = task
+	tasksMutex.Unlock()
+
+	// Start asynchronous processing in goroutine
+	go processVideoAsync(taskID, req)
+
+	// Return task ID immediately (non-blocking)
+	c.JSON(http.StatusAccepted, gin.H{
+		"task_id": taskID,
+		"status":  "pending",
+		"message": "Video processing started asynchronously",
+	})
+}
+
+// processVideoAsync runs the actual video processing in a separate goroutine
+func processVideoAsync(taskID string, req YOLOProcessRequest) {
+	// Update status to processing
+	updateTaskStatus(taskID, "processing", 10, nil, "")
+
 	// Add debugging
-	fmt.Printf("Starting processing for file_id: %s\n", req.FileID)
+	fmt.Printf("Starting async processing for task: %s, file_id: %s\n", taskID, req.FileID)
 
 	// Forward config to YOLO backend
 	configJSON, err := json.Marshal(req.Config)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal config: " + err.Error()})
+		updateTaskStatus(taskID, "failed", 0, nil, "Failed to marshal config: "+err.Error())
 		return
 	}
-	// Create HTTP client with short timeout - YOLO should return task ID immediately
+
+	// Create HTTP client with reasonable timeout for initial request
 	client := &http.Client{
-		Timeout: 6000 * time.Second, // Very short timeout - YOLO must return task ID quickly
+		Timeout: 30 * time.Second, // Short timeout for getting task ID from YOLO
 	}
 
-	fmt.Printf("Sending request to YOLO backend: %s/process-video/%s\n", yoloBackendURL, req.FileID)
+	fmt.Printf("Sending async request to YOLO backend: %s/process-video/%s\n", yoloBackendURL, req.FileID)
 
+	// Start processing on YOLO backend
 	yoloResp, err := client.Post(
 		fmt.Sprintf("%s/process-video/%s", yoloBackendURL, req.FileID),
 		"application/json",
 		bytes.NewBuffer(configJSON),
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start processing: " + err.Error()})
+		updateTaskStatus(taskID, "failed", 0, nil, "Failed to start YOLO processing: "+err.Error())
 		return
 	}
 	defer yoloResp.Body.Close()
 
-	// Read response body first
+	// Read YOLO response
 	bodyBytes, err := io.ReadAll(yoloResp.Body)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read YOLO response: " + err.Error()})
+		updateTaskStatus(taskID, "failed", 0, nil, "Failed to read YOLO response: "+err.Error())
 		return
 	}
 
-	// Log the raw response for debugging
-	fmt.Printf("YOLO response status: %d\n", yoloResp.StatusCode)
-	fmt.Printf("YOLO response body: %s\n", string(bodyBytes))
+	fmt.Printf("YOLO async response status: %d\n", yoloResp.StatusCode)
+	fmt.Printf("YOLO async response body: %s\n", string(bodyBytes))
 
-	// Check if YOLO backend returned an error status
 	if yoloResp.StatusCode >= 400 {
-		// Try to parse as JSON first, if that fails, return the raw text
-		var errorResult map[string]interface{}
-		if json.Unmarshal(bodyBytes, &errorResult) == nil {
-			c.JSON(yoloResp.StatusCode, errorResult)
-		} else {
-			// If not JSON, wrap the text response
-			c.JSON(yoloResp.StatusCode, gin.H{"error": string(bodyBytes)})
+		updateTaskStatus(taskID, "failed", 0, nil, "YOLO backend error: "+string(bodyBytes))
+		return
+	}
+
+	// Parse YOLO response to get their task ID
+	var yoloResult map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &yoloResult); err != nil {
+		updateTaskStatus(taskID, "failed", 0, nil, "Failed to decode YOLO response: "+err.Error())
+		return
+	}
+
+	// Extract YOLO task ID if available
+	yoloTaskID, ok := yoloResult["task_id"].(string)
+	if !ok {
+		// If no task ID, assume processing is complete
+		updateTaskStatus(taskID, "completed", 100, yoloResult, "")
+		return
+	}
+
+	// Poll YOLO backend for completion using goroutine
+	go pollYOLOTaskCompletion(taskID, yoloTaskID, req.FileID)
+}
+
+// pollYOLOTaskCompletion polls YOLO backend for task completion in a separate goroutine
+func pollYOLOTaskCompletion(taskID, yoloTaskID, fileID string) {
+	ticker := time.NewTicker(5 * time.Second) // Poll every 5 seconds
+	defer ticker.Stop()
+
+	timeout := time.After(30 * time.Minute) // Maximum 30 minutes for processing
+
+	for {
+		select {
+		case <-timeout:
+			updateTaskStatus(taskID, "failed", 0, nil, "Processing timeout exceeded")
+			return
+
+		case <-ticker.C:
+			// Check YOLO task status
+			yoloResp, err := http.Get(fmt.Sprintf("%s/task-status/%s", yoloBackendURL, yoloTaskID))
+			if err != nil {
+				fmt.Printf("Error polling YOLO status for task %s: %v\n", taskID, err)
+				continue
+			}
+
+			var statusResult map[string]interface{}
+			if err := json.NewDecoder(yoloResp.Body).Decode(&statusResult); err != nil {
+				yoloResp.Body.Close()
+				fmt.Printf("Error decoding YOLO status for task %s: %v\n", taskID, err)
+				continue
+			}
+			yoloResp.Body.Close()
+
+			// Extract status and progress
+			status, _ := statusResult["status"].(string)
+			progress, _ := statusResult["progress"].(float64)
+
+			// Update our task status
+			switch status {
+			case "completed":
+				// Download results and mark as completed
+				result, err := downloadYOLOResultsForTask(fileID)
+				if err != nil {
+					updateTaskStatus(taskID, "failed", int(progress), nil, "Failed to download results: "+err.Error())
+				} else {
+					updateTaskStatus(taskID, "completed", 100, result, "")
+				}
+				return
+
+			case "failed", "error":
+				errorMsg, _ := statusResult["error"].(string)
+				updateTaskStatus(taskID, "failed", int(progress), nil, "YOLO processing failed: "+errorMsg)
+				return
+
+			default:
+				// Update progress
+				updateTaskStatus(taskID, "processing", int(progress), nil, "")
+			}
 		}
-		return
 	}
+}
 
-	// Parse successful response as JSON
+// updateTaskStatus updates task status using channels for thread-safe communication
+func updateTaskStatus(taskID, status string, progress int, result map[string]interface{}, errorMsg string) {
+	// Send update through channel
+	taskUpdates <- TaskUpdate{
+		TaskID:   taskID,
+		Status:   status,
+		Progress: progress,
+		Result:   result,
+		Error:    errorMsg,
+	}
+}
+
+// Task update processor goroutine
+func processTaskUpdates() {
+	for update := range taskUpdates {
+		tasksMutex.Lock()
+		if task, exists := tasks[update.TaskID]; exists {
+			task.Status = update.Status
+			task.Progress = update.Progress
+
+			if update.Result != nil {
+				task.Result = update.Result
+			}
+
+			if update.Error != "" {
+				task.Error = update.Error
+			}
+
+			if update.Status == "completed" || update.Status == "failed" {
+				now := time.Now()
+				task.CompletedAt = &now
+			}
+
+			fmt.Printf("Task %s updated: status=%s, progress=%d%%\n",
+				update.TaskID, update.Status, update.Progress)
+		}
+		tasksMutex.Unlock()
+	}
+}
+
+// downloadYOLOResultsForTask downloads results from YOLO backend for a specific file
+func downloadYOLOResultsForTask(fileID string) (map[string]interface{}, error) {
+	yoloResp, err := http.Get(fmt.Sprintf("%s/download-json/%s", yoloBackendURL, fileID))
+	if err != nil {
+		return nil, err
+	}
+	defer yoloResp.Body.Close()
+
 	var result map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":        "Failed to decode YOLO response: " + err.Error(),
-			"raw_response": string(bodyBytes),
-		})
-		return
+	if err := json.NewDecoder(yoloResp.Body).Decode(&result); err != nil {
+		return nil, err
 	}
 
-	c.JSON(yoloResp.StatusCode, result)
+	return result, nil
 }
 
 // getYOLOTaskStatus handles the proxy request to get task status
@@ -179,21 +353,18 @@ func getYOLOTaskStatus(c *gin.Context) {
 		return
 	}
 
-	yoloResp, err := http.Get(fmt.Sprintf("%s/task-status/%s", yoloBackendURL, taskID))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get task status: " + err.Error()})
-		return
-	}
-	defer yoloResp.Body.Close()
+	// Get task status from our local storage (thread-safe)
+	tasksMutex.RLock()
+	task, exists := tasks[taskID]
+	tasksMutex.RUnlock()
 
-	// Forward YOLO response
-	var result map[string]interface{}
-	if err := json.NewDecoder(yoloResp.Body).Decode(&result); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode YOLO response: " + err.Error()})
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
 		return
 	}
 
-	c.JSON(yoloResp.StatusCode, result)
+	// Return current task status
+	c.JSON(http.StatusOK, task)
 }
 
 // downloadYOLOResults handles the proxy request to download results
@@ -223,13 +394,18 @@ func downloadYOLOResults(c *gin.Context) {
 	io.Copy(c.Writer, yoloResp.Body)
 }
 
-// initYOLOBackend initializes the YOLO backend URL
+// initYOLOBackend initializes the YOLO backend URL and starts background goroutines
 func initYOLOBackend() {
 	yoloBackendURL = os.Getenv("YOLO_BACKEND_URL")
 	if yoloBackendURL == "" {
 		// Keep using Cloudflare for now since direct TCP isn't working
-		// But we'll use very short timeouts to force async behavior
+		// But we'll use short timeouts to force async behavior
 		yoloBackendURL = "https://yolo-49638678323.europe-west4.run.app" // Cloudflare proxy
 	}
 	fmt.Printf("YOLO Backend URL: %s\n", yoloBackendURL)
+
+	// Start background goroutine for processing task updates
+	go processTaskUpdates()
+
+	fmt.Printf("Asynchronous task processing system initialized\n")
 }

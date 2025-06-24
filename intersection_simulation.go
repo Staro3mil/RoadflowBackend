@@ -97,27 +97,63 @@ func createIntersectionHandler(c *gin.Context) {
 	claimsI, _ := c.Get("claims")
 	claims := claimsI.(jwt.MapClaims)
 	user := claims["name"].(string)
-
 	// Parse the multipart form
-	err := c.Request.ParseMultipartForm(10 << 20) // 10 MB max
-	if err != nil {
+	if err := c.Request.ParseMultipartForm(10 << 20); err != nil { // 10 MB max
 		c.JSON(400, gin.H{"error": "Failed to parse multipart form"})
 		return
 	}
 
-	// Get the JSON file from the form
-	file, _, err := c.Request.FormFile("json_file")
+	// Try to get JSON file first, then Excel file
+	var file multipart.File
+	var fileHeader *multipart.FileHeader
+	var isExcelFile bool
+
+	// Check for JSON file
+	file, fileHeader, err := c.Request.FormFile("json_file")
 	if err != nil {
-		c.JSON(400, gin.H{"error": "No JSON file provided"})
-		return
+		// If JSON file not found, try Excel file
+		file, fileHeader, err = c.Request.FormFile("excel_file")
+		if err != nil {
+			c.JSON(400, gin.H{"error": "No JSON or Excel file provided"})
+			return
+		}
+		isExcelFile = true
 	}
 	defer file.Close()
 
-	// Read the JSON content
-	jsonData, err := io.ReadAll(file)
+	// Read the file content
+	fileData, err := io.ReadAll(file)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to read JSON file"})
+		c.JSON(500, gin.H{"error": "Failed to read file"})
 		return
+	}
+
+	var jsonData []byte
+	if isExcelFile {
+		// For Excel files, we don't parse as JSON but will handle specially
+		log.Printf("Processing Excel file: %s", fileHeader.Filename)
+
+		// For Excel files, we'll create a minimal JSON structure to determine the action
+		// Get additional form data (intersection name, action)
+		intersectionName := c.Request.FormValue("intersection_name")
+		action := c.Request.FormValue("action")
+
+		if action == "" {
+			action = "create_yolo_queue" // default for Excel uploads
+		}
+		if intersectionName == "" {
+			intersectionName = "excel_intersection"
+		}
+
+		// Create minimal JSON for action parsing
+		actionJSON := map[string]interface{}{
+			"action":            action,
+			"intersection_name": intersectionName,
+		}
+		jsonData, _ = json.Marshal(actionJSON)
+	} else {
+		// For JSON files, use the content directly
+		jsonData = fileData
 	}
 	// Parse and validate the JSON structure
 	// First, determine the request type by checking the action field
@@ -163,7 +199,6 @@ func createIntersectionHandler(c *gin.Context) {
 		fileName = fmt.Sprintf("weibull_queue_%d", weibullRequest.IntersectionID)
 		intersectionName = fmt.Sprintf("intersection_%d", weibullRequest.IntersectionID)
 		log.Printf("Processing Weibull queue request for user %s: intersection %d", user, weibullRequest.IntersectionID)
-
 	case "create_weibull_queue":
 		var weibullCreationRequest WeibullQueueCreationRequest
 		if err := json.Unmarshal(jsonData, &weibullCreationRequest); err != nil {
@@ -177,6 +212,66 @@ func createIntersectionHandler(c *gin.Context) {
 		fileName = fmt.Sprintf("weibull_queue_creation_%s", weibullCreationRequest.IntersectionID)
 		intersectionName = fmt.Sprintf("intersection_%s_weibull", weibullCreationRequest.IntersectionID)
 		log.Printf("Processing Weibull queue creation request for user %s: intersection %s", user, weibullCreationRequest.IntersectionID)
+	case "create_yolo_queue":
+		// Handle Excel file upload for YOLO queue creation
+		log.Printf("Processing YOLO queue creation from Excel for user %s", user)
+
+		// For Excel uploads, we need to send the Excel file directly to the Weibull backend
+		var excelRequest struct {
+			Action           string `json:"action"`
+			IntersectionName string `json:"intersection_name"`
+		}
+		if err := json.Unmarshal(jsonData, &excelRequest); err != nil {
+			// If JSON parsing fails, create a default request
+			excelRequest.Action = "create_yolo_queue"
+			excelRequest.IntersectionName = "excel_intersection"
+		}
+
+		fileName = fmt.Sprintf("yolo_queue_excel_%s", excelRequest.IntersectionName)
+		intersectionName = fmt.Sprintf("intersection_%s_yolo", excelRequest.IntersectionName)
+		log.Printf("Processing YOLO queue creation from Excel for user %s: intersection %s", user, excelRequest.IntersectionName)
+
+		// For Excel files, we need to send the actual Excel file, not JSON
+		if isExcelFile {
+			log.Printf("Sending Excel file to simulation endpoint for intersection: %s", excelRequest.IntersectionName)
+
+			// Create a new multipart form with the Excel file for the simulation endpoint
+			var requestBody bytes.Buffer
+			writer := multipart.NewWriter(&requestBody)
+
+			// Create form file field for the Excel file
+			part, err := writer.CreateFormFile("excel_file", fileHeader.Filename)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to create form file for Excel"})
+				return
+			}
+
+			// Write the Excel file data
+			if _, err := part.Write(fileData); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to write Excel file data"})
+				return
+			}
+
+			// Add the action and intersection name as form fields
+			writer.WriteField("action", excelRequest.Action)
+			writer.WriteField("intersection_name", excelRequest.IntersectionName)
+
+			writer.Close()
+
+			// Send to simulation endpoint with Excel file
+			zipData, err := sendExcelToSimulationEndpoint(&requestBody, writer.FormDataContentType())
+			if err != nil {
+				log.Printf("Failed to call simulation endpoint with Excel: %v", err)
+				c.JSON(500, gin.H{"error": "Failed to process Excel simulation request"})
+				return
+			}
+
+			// Return the zip file as response
+			c.Header("Content-Type", "application/zip")
+			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s.zip", fileName))
+			c.Data(200, "application/zip", zipData)
+			return
+		}
 
 	default:
 		c.JSON(400, gin.H{"error": fmt.Sprintf("Unknown action: %s", genericRequest.Action)})
@@ -192,11 +287,6 @@ func createIntersectionHandler(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "Failed to process simulation request"})
 		return
 	}
-
-	// Return the zip file as response
-	c.Header("Content-Type", "application/zip")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s.zip", fileName))
-	c.Data(200, "application/zip", zipData)
 	// Return the zip file as response
 	c.Header("Content-Type", "application/zip")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s.zip", fileName))
@@ -494,5 +584,49 @@ func sendToSimulationEndpoint(jsonData []byte) ([]byte, error) {
 	}
 
 	log.Printf("Successfully received %d bytes from simulation endpoint", len(zipData))
+	return zipData, nil
+}
+
+// sendExcelToSimulationEndpoint sends Excel file data to the external simulation endpoint
+func sendExcelToSimulationEndpoint(requestBody *bytes.Buffer, contentType string) ([]byte, error) {
+	// Get the simulation URL from environment variable
+	simulationURL := os.Getenv("URL_SIMULATION")
+	if simulationURL == "" {
+		// Default URL if not set in environment
+		simulationURL = "http://localhost:8080/simulate" // Replace with your actual simulation endpoint
+		log.Printf("Warning: URL_SIMULATION not set in environment, using default: %s", simulationURL)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", simulationURL, requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %v", err)
+	}
+
+	// Set the content type (multipart form data with boundary)
+	req.Header.Set("Content-Type", contentType)
+
+	// Create HTTP client with timeout and send request
+	client := &http.Client{
+		Timeout: 5 * time.Minute, // 5 minute timeout for simulation requests
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send HTTP request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check if the response status is OK
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("simulation endpoint returned status %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	// Read the response body (should be a zip file)
+	zipData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	log.Printf("Successfully received %d bytes from simulation endpoint for Excel file", len(zipData))
 	return zipData, nil
 }

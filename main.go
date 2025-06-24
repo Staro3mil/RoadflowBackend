@@ -1564,17 +1564,64 @@ func detectLocationHandler(c *gin.Context) {
 }
 
 // updateVideoMetadata updates the metadata of a video in S3
-func updateVideoMetadata(s3Key string, metadata map[string]string) error {
-	// Copy the object to itself with new metadata
+func updateVideoMetadata(s3Key string, newMetadata map[string]string) error {
+	// First, get the existing metadata
+	headOutput, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		log.Printf("Failed to get existing metadata for %s: %v", s3Key, err)
+		return err
+	}
+
+	// Merge existing metadata with new metadata
+	mergedMetadata := make(map[string]string)
+
+	// Copy existing metadata
+	if headOutput.Metadata != nil {
+		for k, v := range headOutput.Metadata {
+			mergedMetadata[k] = v
+		}
+	}
+
+	// Add/overwrite with new metadata
+	for k, v := range newMetadata {
+		mergedMetadata[k] = v
+	}
+
+	log.Printf("Updating metadata for %s. Existing keys: %v, New keys: %v", s3Key,
+		func() []string {
+			keys := make([]string, 0, len(headOutput.Metadata))
+			for k := range headOutput.Metadata {
+				keys = append(keys, k)
+			}
+			return keys
+		}(),
+		func() []string {
+			keys := make([]string, 0, len(newMetadata))
+			for k := range newMetadata {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
+
+	// Copy the object to itself with merged metadata
 	copySource := bucketName + "/" + s3Key
 
-	_, err := s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+	_, err = s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
 		Bucket:            aws.String(bucketName),
 		Key:               aws.String(s3Key),
 		CopySource:        aws.String(copySource),
-		Metadata:          metadata,
+		Metadata:          mergedMetadata,
 		MetadataDirective: "REPLACE",
 	})
+
+	if err != nil {
+		log.Printf("Failed to update metadata for %s: %v", s3Key, err)
+	} else {
+		log.Printf("Successfully updated metadata for %s", s3Key)
+	}
 
 	return err
 }
@@ -1644,13 +1691,12 @@ func main() {
 	initS3()
 	initYOLOBackend()
 
-	r := gin.Default()
-	// CORS configuration using the default settings
+	r := gin.Default() // CORS configuration using the default settings
 	r.Use(cors.New(cors.Config{
 		AllowOrigins: []string{
 			"http://localhost:8081",
 			"http://localhost:5000",
-			"https://peaceful-dragon-66b0be.netlify.app",
+			"https://roadflow.motorcycles",
 			"https://processingflaskapp-49638678323.europe-central2.run.app",
 		},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
