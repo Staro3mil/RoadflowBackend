@@ -231,37 +231,55 @@ func createIntersectionHandler(c *gin.Context) {
 		intersectionName = fmt.Sprintf("intersection_%s_yolo", excelRequest.IntersectionName)
 		log.Printf("Processing YOLO queue creation from Excel for user %s: intersection %s", user, excelRequest.IntersectionName)
 
-		// For Excel files, we need to send the actual Excel file, not JSON
+		// For Excel files, we need to send both JSON and Excel file
 		if isExcelFile {
-			log.Printf("Sending Excel file to simulation endpoint for intersection: %s", excelRequest.IntersectionName)
+			log.Printf("Sending both JSON and Excel file to simulation endpoint for intersection: %s", excelRequest.IntersectionName)
 
-			// Create a new multipart form with the Excel file for the simulation endpoint
-			var requestBody bytes.Buffer
-			writer := multipart.NewWriter(&requestBody)
-
-			// Create form file field for the Excel file
-			part, err := writer.CreateFormFile("excel_file", fileHeader.Filename)
+			// Create JSON file with intersection metadata
+			jsonMetadata := map[string]interface{}{
+				"action":            excelRequest.Action,
+				"intersection_name": excelRequest.IntersectionName,
+				"file_type":         "excel",
+				"timestamp":         time.Now().Unix(),
+			}
+			jsonBytes, err := json.Marshal(jsonMetadata)
 			if err != nil {
-				c.JSON(500, gin.H{"error": "Failed to create form file for Excel"})
+				c.JSON(500, gin.H{"error": "Failed to create JSON metadata"})
 				return
 			}
 
-			// Write the Excel file data
-			if _, err := part.Write(fileData); err != nil {
+			// Create a new multipart form with both JSON and Excel files
+			var requestBody bytes.Buffer
+			writer := multipart.NewWriter(&requestBody)
+
+			// First, add the JSON file
+			jsonPart, err := writer.CreateFormFile("json_file", "input.json")
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to create JSON form file"})
+				return
+			}
+			if _, err := jsonPart.Write(jsonBytes); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to write JSON metadata"})
+				return
+			}
+
+			// Second, add the Excel file
+			excelPart, err := writer.CreateFormFile("excel_file", fileHeader.Filename)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to create Excel form file"})
+				return
+			}
+			if _, err := excelPart.Write(fileData); err != nil {
 				c.JSON(500, gin.H{"error": "Failed to write Excel file data"})
 				return
 			}
 
-			// Add the action and intersection name as form fields
-			writer.WriteField("action", excelRequest.Action)
-			writer.WriteField("intersection_name", excelRequest.IntersectionName)
-
 			writer.Close()
 
-			// Send to simulation endpoint with Excel file
+			// Send to simulation endpoint with both files
 			zipData, err := sendExcelToSimulationEndpoint(&requestBody, writer.FormDataContentType())
 			if err != nil {
-				log.Printf("Failed to call simulation endpoint with Excel: %v", err)
+				log.Printf("Failed to call simulation endpoint with Excel and JSON: %v", err)
 				c.JSON(500, gin.H{"error": "Failed to process Excel simulation request"})
 				return
 			}
@@ -587,7 +605,7 @@ func sendToSimulationEndpoint(jsonData []byte) ([]byte, error) {
 	return zipData, nil
 }
 
-// sendExcelToSimulationEndpoint sends Excel file data to the external simulation endpoint
+// sendExcelToSimulationEndpoint sends both JSON and Excel file data to the external simulation endpoint
 func sendExcelToSimulationEndpoint(requestBody *bytes.Buffer, contentType string) ([]byte, error) {
 	// Get the simulation URL from environment variable
 	simulationURL := os.Getenv("URL_SIMULATION")
@@ -596,6 +614,10 @@ func sendExcelToSimulationEndpoint(requestBody *bytes.Buffer, contentType string
 		simulationURL = "http://localhost:8080/simulate" // Replace with your actual simulation endpoint
 		log.Printf("Warning: URL_SIMULATION not set in environment, using default: %s", simulationURL)
 	}
+
+	log.Printf("Sending multipart request to simulation endpoint: %s", simulationURL)
+	log.Printf("Request body size: %d bytes", requestBody.Len())
+	log.Printf("Content-Type: %s", contentType)
 
 	// Create HTTP request
 	req, err := http.NewRequest("POST", simulationURL, requestBody)
@@ -618,7 +640,9 @@ func sendExcelToSimulationEndpoint(requestBody *bytes.Buffer, contentType string
 
 	// Check if the response status is OK
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("simulation endpoint returned status %d: %s", resp.StatusCode, resp.Status)
+		// Read response body for error details
+		errorBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("simulation endpoint returned status %d: %s, body: %s", resp.StatusCode, resp.Status, string(errorBody))
 	}
 
 	// Read the response body (should be a zip file)
@@ -627,6 +651,6 @@ func sendExcelToSimulationEndpoint(requestBody *bytes.Buffer, contentType string
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	log.Printf("Successfully received %d bytes from simulation endpoint for Excel file", len(zipData))
+	log.Printf("Successfully received %d bytes from simulation endpoint for Excel+JSON request", len(zipData))
 	return zipData, nil
 }

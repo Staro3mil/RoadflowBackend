@@ -60,7 +60,7 @@ type User struct {
 	Status       string `bson:"status" json:"status"` // e.g. "active", "suspended"
 }
 
-// recaptchaResponse mirrors Google’s JSON response structure.
+// recaptchaResponse mirrors Google's JSON response structure.
 type recaptchaResponse struct {
 	Success     bool     `json:"success"`
 	Score       float64  `json:"score,omitempty"`
@@ -135,11 +135,28 @@ func register(c *gin.Context) {
 		return
 	}
 
-	_, err = verifyCaptcha(input.CaptchaToken)
+	captchaResult, err := verifyCaptcha(input.CaptchaToken)
 	if err != nil {
+		log.Printf("reCAPTCHA verification error: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CAPTCHA verification failed"})
+		return
+	}
+
+	// Check if reCAPTCHA is valid and score is acceptable (for v3)
+	if !captchaResult.Success {
+		log.Printf("reCAPTCHA failed: %+v", captchaResult)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CAPTCHA"})
 		return
 	}
+
+	// For v3, check the score (0.0 = likely bot, 1.0 = likely human)
+	if captchaResult.Score > 0 && captchaResult.Score < 0.5 {
+		log.Printf("reCAPTCHA score too low: %.2f", captchaResult.Score)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CAPTCHA score too low - please try again"})
+		return
+	}
+
+	log.Printf("reCAPTCHA verification successful: Score=%.2f, Action=%s", captchaResult.Score, captchaResult.Action)
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -204,13 +221,12 @@ func register(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Hello " + input.Name, "token": tokenString})
 }
 
-// verifyCaptcha sends the token to Google's v3 verify endpoint.
+// verifyCaptcha sends the token to Google's reCAPTCHA v3 siteverify endpoint.
 func verifyCaptcha(token string) (*recaptchaResponse, error) {
 	// Build the form-encoded POST
 	form := url.Values{
 		"secret":   {os.Getenv("RECAPTCHA_SECRET")},
 		"response": {token},
-		// If you want, you can also pass "remoteip": {userIPString}
 	}
 	resp, err := http.PostForm("https://www.google.com/recaptcha/api/siteverify", form)
 	if err != nil {
@@ -219,8 +235,8 @@ func verifyCaptcha(token string) (*recaptchaResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	// Read the raw body for extra debugging (optional)
-	rawBody, err := ioutil.ReadAll(resp.Body)
+	// Read the raw body
+	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[reCAPTCHA] Error reading response body: %v\n", err)
 		return nil, err
@@ -233,8 +249,9 @@ func verifyCaptcha(token string) (*recaptchaResponse, error) {
 		return nil, err
 	}
 
-	// Log the entire response so you see error codes, score, etc.
-	log.Printf("[reCAPTCHA] siteverify response: %+v\n", result)
+	// Log the response for debugging
+	log.Printf("[reCAPTCHA] siteverify response: Success=%v, Score=%.2f, Action=%s, Errors=%v\n",
+		result.Success, result.Score, result.Action, result.ErrorCodes)
 
 	return &result, nil
 }
@@ -262,11 +279,29 @@ func login(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
-	_, err = verifyCaptcha(input.CaptchaToken)
+
+	captchaResult, err := verifyCaptcha(input.CaptchaToken)
 	if err != nil {
+		log.Printf("reCAPTCHA verification error during login: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CAPTCHA verification failed"})
+		return
+	}
+
+	// Check if reCAPTCHA is valid and score is acceptable (for v3)
+	if !captchaResult.Success {
+		log.Printf("reCAPTCHA failed during login: %+v", captchaResult)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CAPTCHA"})
 		return
 	}
+
+	// For v3, check the score (0.0 = likely bot, 1.0 = likely human)
+	if captchaResult.Score > 0 && captchaResult.Score < 0.5 {
+		log.Printf("reCAPTCHA score too low during login: %.2f", captchaResult.Score)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CAPTCHA score too low - please try again"})
+		return
+	}
+
+	log.Printf("reCAPTCHA verification successful during login: Score=%.2f, Action=%s", captchaResult.Score, captchaResult.Action)
 	// Compare the provided password with the hashed password stored in MongoDB
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
@@ -1735,6 +1770,7 @@ func main() {
 		authorized.POST("/yolo/process", processVideoWithYOLO)
 		authorized.GET("/yolo/status/:task_id", getYOLOTaskStatus)
 		authorized.GET("/yolo/download/:file_id", downloadYOLOResults)
+		authorized.HEAD("/yolo/download/:file_id", downloadYOLOResults) // Support HEAD requests for status checking
 
 		// Admin routes
 		admin := authorized.Group("/")
