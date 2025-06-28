@@ -95,6 +95,12 @@ type GenericRequest struct {
 	Action string `json:"action"`
 }
 
+// AnalysisRequest represents a simple analysis request with intersection ID and action
+type AnalysisRequest struct {
+	IntersectionID string `json:"intersection_id"`
+	Action         string `json:"action"`
+}
+
 // IntersectionLocationRequest represents a request to link an intersection to a video for location data
 type IntersectionLocationRequest struct {
 	IntersectionName string `json:"intersection_name"`
@@ -165,24 +171,40 @@ func createIntersectionHandler(c *gin.Context) {
 		// For Excel files, we don't parse as JSON but will handle specially
 		log.Printf("Processing Excel file: %s", fileHeader.Filename)
 
-		// For Excel files, we'll create a minimal JSON structure to determine the action
-		// Get additional form data (intersection name, action)
-		intersectionName := c.Request.FormValue("intersection_name")
-		action := c.Request.FormValue("action")
+		// For Excel files with JSON metadata, read the actual JSON file content
+		jsonFile, jsonFileHeader, jsonErr := c.Request.FormFile("json_file")
+		if jsonErr == nil {
+			// JSON metadata file is present, read its content
+			defer jsonFile.Close()
+			jsonContent, err := io.ReadAll(jsonFile)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to read JSON metadata file"})
+				return
+			}
+			jsonData = jsonContent
+			log.Printf("Using JSON metadata from uploaded file: %s", jsonFileHeader.Filename)
+		} else {
+			// No JSON metadata file, create minimal JSON for action parsing
+			log.Printf("No JSON metadata file found, creating minimal JSON for action parsing")
 
-		if action == "" {
-			action = "create_yolo_queue" // default for Excel uploads
-		}
-		if intersectionName == "" {
-			intersectionName = "excel_intersection"
-		}
+			// Get additional form data (intersection name, action)
+			intersectionName := c.Request.FormValue("intersection_name")
+			action := c.Request.FormValue("action")
 
-		// Create minimal JSON for action parsing
-		actionJSON := map[string]interface{}{
-			"action":            action,
-			"intersection_name": intersectionName,
+			if action == "" {
+				action = "create_yolo_queue" // default for Excel uploads
+			}
+			if intersectionName == "" {
+				intersectionName = "excel_intersection"
+			}
+
+			// Create minimal JSON for action parsing
+			actionJSON := map[string]interface{}{
+				"action":            action,
+				"intersection_name": intersectionName,
+			}
+			jsonData, _ = json.Marshal(actionJSON)
 		}
-		jsonData, _ = json.Marshal(actionJSON)
 	} else {
 		// For JSON files, use the content directly
 		jsonData = fileData
@@ -231,6 +253,72 @@ func createIntersectionHandler(c *gin.Context) {
 		fileName = fmt.Sprintf("weibull_queue_%d", weibullRequest.IntersectionID)
 		intersectionName = fmt.Sprintf("intersection_%d", weibullRequest.IntersectionID)
 		log.Printf("Processing Weibull queue request for user %s: intersection %d", user, weibullRequest.IntersectionID)
+
+	case "Read_yolo_queue":
+		var yoloRequest WeibullQueueRequest // Same structure as Weibull request
+		if err := json.Unmarshal(jsonData, &yoloRequest); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid YOLO queue request format"})
+			return
+		}
+		if err := validateWeibullQueueRequest(&yoloRequest); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		fileName = fmt.Sprintf("yolo_queue_%d", yoloRequest.IntersectionID)
+		intersectionName = fmt.Sprintf("intersection_%d", yoloRequest.IntersectionID)
+		log.Printf("Processing YOLO queue request for user %s: intersection %d", user, yoloRequest.IntersectionID)
+
+	case "Show_output_queue", "Show_queue_changes", "Show_table_mean_time", "Show_time_changes", "Show_queue_load":
+		// Handle analysis actions - these are simple requests with intersection_id and action
+		var analysisRequest AnalysisRequest
+		if err := json.Unmarshal(jsonData, &analysisRequest); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid analysis request format"})
+			return
+		}
+		if analysisRequest.IntersectionID == "" {
+			c.JSON(400, gin.H{"error": "intersection_id is required for analysis requests"})
+			return
+		}
+
+		// Create the complete JSON structure expected by the simulation endpoint
+		completeAnalysisJSON := map[string]interface{}{
+			"intersection_id": analysisRequest.IntersectionID, // Mock data for now
+			"algorithm_id":    1,
+			"algorithm_id2":   2,
+			"algorithm_id3":   4,
+			"traffic_load":    2, // Mock data
+			"queue_algorithm": 2, // Mock data
+			"action":          analysisRequest.Action,
+			"yellow_time":     3, // Mock data
+			"train_episodes":  0, // Mock data
+			"eval_every":      0, // Mock data
+		}
+
+		if genericRequest.Action == "Show_queue_load" {
+			log.Println("QUEUE LOAD ACTION DETECTED")
+			completeAnalysisJSON = map[string]interface{}{
+				"intersection_id": 22,
+				"algorithm_id":    1,
+				"traffic_load":    1,
+				"queue_algorithm": 2,
+				"action":          "Show_queue_load",
+				"yellow_time":     3,
+				"train_episodes":  0,
+				"eval_every":      0,
+			}
+		}
+
+		// Convert back to JSON bytes for sending to simulation endpoint
+		jsonData, err = json.Marshal(completeAnalysisJSON)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to marshal analysis JSON"})
+			return
+		}
+
+		fileName = fmt.Sprintf("analysis_%s_%s", analysisRequest.Action, analysisRequest.IntersectionID)
+		intersectionName = fmt.Sprintf("intersection_%s", analysisRequest.IntersectionID)
+		log.Printf("Processing analysis request %s for user %s: intersection %s", analysisRequest.Action, user, analysisRequest.IntersectionID)
+
 	case "create_weibull_queue":
 		var weibullCreationRequest WeibullQueueCreationRequest
 		if err := json.Unmarshal(jsonData, &weibullCreationRequest); err != nil {
@@ -247,6 +335,7 @@ func createIntersectionHandler(c *gin.Context) {
 	case "create_yolo_queue":
 		// Handle Excel file upload for YOLO queue creation
 		log.Printf("Processing YOLO queue creation from Excel for user %s", user)
+		log.Printf("JSON data being parsed: %s", string(jsonData))
 
 		// For Excel uploads, we need to send the Excel file directly to the Weibull backend
 		var excelRequest struct {
@@ -258,7 +347,8 @@ func createIntersectionHandler(c *gin.Context) {
 		}
 		if err := json.Unmarshal(jsonData, &excelRequest); err != nil {
 			// If JSON parsing fails, create a default request
-			log.Println("COULDNT UNMARSHAL JSON DATA, USING DEFAULTS")
+			log.Printf("Failed to unmarshal JSON data for Excel request: %v", err)
+			log.Printf("Raw JSON data: %s", string(jsonData))
 			excelRequest.Action = "create_yolo_queue"
 			excelRequest.IntersectionID = "2"
 			excelRequest.AlgorithmID = 0
@@ -266,9 +356,12 @@ func createIntersectionHandler(c *gin.Context) {
 			excelRequest.QueueAlgorithm = 3
 		}
 
-		excelRequest.IntersectionID = "2"
+		log.Printf("Excel request unmarshaled - IntersectionID: '%s', Action: '%s', AlgorithmID: %d, TrafficLoad: %d, QueueAlgorithm: %d",
+			excelRequest.IntersectionID, excelRequest.Action, excelRequest.AlgorithmID, excelRequest.TrafficLoad, excelRequest.QueueAlgorithm)
 
 		log.Printf("Processing YOLO queue creation from Excel for user %s: intersection %s", user, excelRequest.IntersectionID)
+		fileName = fmt.Sprintf("yolo_queue_%s", excelRequest.IntersectionID)
+		intersectionName = fmt.Sprintf("intersection_%s_yolo", excelRequest.IntersectionID)
 
 		// For Excel files, we need to send both JSON and Excel file
 		if isExcelFile {
@@ -418,8 +511,8 @@ func validateIntersectionRequest(req *IntersectionRequest) error {
 }
 
 func validateWeibullQueueRequest(req *WeibullQueueRequest) error {
-	if req.Action != "Read_weibull_queue" {
-		return fmt.Errorf("invalid action for Weibull queue request: %s", req.Action)
+	if req.Action != "Read_weibull_queue" && req.Action != "Read_yolo_queue" {
+		return fmt.Errorf("invalid action for queue request: %s (expected Read_weibull_queue or Read_yolo_queue)", req.Action)
 	}
 	if req.IntersectionID <= 0 {
 		return fmt.Errorf("intersection_id must be positive")
@@ -433,9 +526,7 @@ func validateWeibullQueueRequest(req *WeibullQueueRequest) error {
 	if req.AlgorithmID3 <= 0 {
 		return fmt.Errorf("algorithm_id3 must be positive")
 	}
-	if req.TrafficLoad != 1 && req.TrafficLoad != 2 {
-		return fmt.Errorf("traffic_load must be 1 (low) or 2 (medium)")
-	}
+
 	if req.QueueAlgorithm <= 0 {
 		return fmt.Errorf("queue_algorithm must be positive")
 	}
