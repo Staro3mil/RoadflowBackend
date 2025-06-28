@@ -617,11 +617,12 @@ func makeDownloadProxy(remoteURL, localFilename string) gin.HandlerFunc {
 
 // IntersectionInfo represents the intersection data with metadata
 type IntersectionInfo struct {
-	Name           string   `json:"name"`
-	ID             string   `json:"id,omitempty"`
-	DirectionCodes []string `json:"direction_codes,omitempty"`
-	DirectionCount string   `json:"direction_count,omitempty"`
-	PhaseCount     string   `json:"phase_count,omitempty"`
+	Name           string          `json:"name"`
+	ID             string          `json:"id,omitempty"`
+	DirectionCodes []string        `json:"direction_codes,omitempty"`
+	DirectionCount string          `json:"direction_count,omitempty"`
+	PhaseCount     string          `json:"phase_count,omitempty"`
+	Location       *LocationResult `json:"location,omitempty"`
 }
 
 // listIntersections handler
@@ -666,24 +667,50 @@ func listIntersections(c *gin.Context) {
 
 			if err != nil {
 				log.Printf("Error getting metadata for %s: %v", intersectionName, err)
-			} else if headOutput.Metadata == nil {
-				log.Printf("No metadata found for %s", intersectionName)
-			} else {
-				log.Printf("Found metadata for %s: %+v", intersectionName, headOutput.Metadata)
+			} else if headOutput.Metadata != nil {
 				// Extract metadata if available
 				if id, exists := headOutput.Metadata["intersection_id"]; exists {
 					intersection.ID = id
-					log.Printf("Set intersection ID: %s", id)
 				}
 				if dirCodes, exists := headOutput.Metadata["direction_codes"]; exists && dirCodes != "" {
 					intersection.DirectionCodes = strings.Split(dirCodes, ",")
-					log.Printf("Set direction codes: %v", intersection.DirectionCodes)
 				}
 				if dirCount, exists := headOutput.Metadata["direction_count"]; exists {
 					intersection.DirectionCount = dirCount
 				}
 				if phaseCount, exists := headOutput.Metadata["phase_count"]; exists {
 					intersection.PhaseCount = phaseCount
+				}
+
+				// Extract location data if available
+				location := &LocationResult{}
+				hasLocationData := false
+
+				// Check for address
+				if address, exists := headOutput.Metadata["address"]; exists && address != "" {
+					location.Address = address
+					hasLocationData = true
+				}
+
+				// Check for latitude
+				if latStr, exists := headOutput.Metadata["latitude"]; exists && latStr != "" {
+					if lat, err := strconv.ParseFloat(latStr, 64); err == nil {
+						location.Latitude = lat
+						hasLocationData = true
+					}
+				}
+
+				// Check for longitude
+				if lngStr, exists := headOutput.Metadata["longitude"]; exists && lngStr != "" {
+					if lng, err := strconv.ParseFloat(lngStr, 64); err == nil {
+						location.Longitude = lng
+						hasLocationData = true
+					}
+				}
+
+				// Assign location if we found any location data
+				if hasLocationData {
+					intersection.Location = location
 				}
 			}
 
@@ -695,6 +722,7 @@ func listIntersections(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "No intersections found. Would you like to upload one now?"})
 		return
 	}
+
 	c.JSON(200, intersections)
 }
 
@@ -1756,15 +1784,18 @@ func main() {
 	{
 		authorized.GET("/landing", landingHandler)
 		authorized.GET("/intersections", listIntersections)
-		authorized.POST("/simulate-intersection", createIntersectionHandler) // New intersection creation endpoint
-		authorized.DELETE("/intersections/:name", deleteIntersectionHandler) // Delete intersection endpoint
-		authorized.GET("/users/me/recordings", listMyRecordings)             // Existing
-		authorized.GET("/user-videos", listUserVideos)                       // New endpoint for analyze videos
-		authorized.POST("/users/me/recordings/rename", renameMyRecording)    // New
-		authorized.DELETE("/users/me/recordings", deleteMyRecording)         // New
-		authorized.POST("/upload", uploadHandler)                            // YOLO proxy routes
-		authorized.POST("/detect-location", detectLocationHandler)           // Location detection endpoint
-		authorized.POST("/save-video-location", saveVideoLocationHandler)    // Save video location endpoint
+		authorized.GET("/intersections-with-location", listIntersectionsWithLocationHandler) // Get intersections with location for map
+		authorized.POST("/simulate-intersection", createIntersectionHandler)                 // New intersection creation endpoint
+		authorized.POST("/intersections/link-video", linkIntersectionToVideoHandler)         // Link intersection to video for location
+		authorized.DELETE("/intersections/:name", deleteIntersectionHandler)                 // Delete intersection endpoint
+		authorized.GET("/users/me/recordings", listMyRecordings)                             // Existing
+		authorized.GET("/recordings-with-location", listRecordingsWithLocation)              // Get recordings with location data
+		authorized.GET("/user-videos", listUserVideos)                                       // New endpoint for analyze videos
+		authorized.POST("/users/me/recordings/rename", renameMyRecording)                    // New
+		authorized.DELETE("/users/me/recordings", deleteMyRecording)                         // New
+		authorized.POST("/upload", uploadHandler)                                            // YOLO proxy routes
+		authorized.POST("/detect-location", detectLocationHandler)                           // Location detection endpoint
+		authorized.POST("/save-video-location", saveVideoLocationHandler)                    // Save video location endpoint
 		// YOLO proxy routes
 		authorized.POST("/yolo/upload", uploadVideoToYOLO)
 		authorized.POST("/yolo/process", processVideoWithYOLO)

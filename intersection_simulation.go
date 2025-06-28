@@ -20,6 +20,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,8 +39,11 @@ type IntersectionRequest struct {
 }
 
 type Intersection struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Latitude  *float64 `json:"latitude,omitempty"`
+	Longitude *float64 `json:"longitude,omitempty"`
+	Address   *string  `json:"address,omitempty"`
 }
 
 type Direction struct {
@@ -91,6 +95,22 @@ type GenericRequest struct {
 	Action string `json:"action"`
 }
 
+// IntersectionLocationRequest represents a request to link an intersection to a video for location data
+type IntersectionLocationRequest struct {
+	IntersectionName string `json:"intersection_name"`
+	VideoKey         string `json:"video_key"`
+}
+
+// IntersectionWithLocation represents an intersection with its location metadata for map display
+type IntersectionWithLocation struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Address   string  `json:"address"`
+	UserName  string  `json:"user_name"`
+}
+
 // createIntersectionHandler handles intersection creation requests
 func createIntersectionHandler(c *gin.Context) {
 	// Get user from JWT claims
@@ -118,6 +138,18 @@ func createIntersectionHandler(c *gin.Context) {
 			return
 		}
 		isExcelFile = true
+	} else {
+		// JSON file found, also check for Excel file
+		excelFile, excelFileHeader, excelErr := c.Request.FormFile("excel_file")
+		if excelErr == nil {
+			// Both files present - this is an Excel upload with JSON metadata
+			isExcelFile = true
+			defer excelFile.Close()
+			// For Excel processing, we need both files
+			defer file.Close()
+			file = excelFile
+			fileHeader = excelFileHeader
+		}
 	}
 	defer file.Close()
 
@@ -218,47 +250,57 @@ func createIntersectionHandler(c *gin.Context) {
 
 		// For Excel uploads, we need to send the Excel file directly to the Weibull backend
 		var excelRequest struct {
-			Action           string `json:"action"`
-			IntersectionName string `json:"intersection_name"`
+			Action         string `json:"action"`
+			IntersectionID string `json:"intersection_id"`
+			AlgorithmID    int    `json:"algorithm_id"`
+			TrafficLoad    int    `json:"traffic_load"`
+			QueueAlgorithm int    `json:"queue_algorithm"`
 		}
 		if err := json.Unmarshal(jsonData, &excelRequest); err != nil {
 			// If JSON parsing fails, create a default request
+			log.Println("COULDNT UNMARSHAL JSON DATA, USING DEFAULTS")
 			excelRequest.Action = "create_yolo_queue"
-			excelRequest.IntersectionName = "excel_intersection"
+			excelRequest.IntersectionID = "2"
+			excelRequest.AlgorithmID = 0
+			excelRequest.TrafficLoad = 3
+			excelRequest.QueueAlgorithm = 3
 		}
 
-		fileName = fmt.Sprintf("yolo_queue_excel_%s", excelRequest.IntersectionName)
-		intersectionName = fmt.Sprintf("intersection_%s_yolo", excelRequest.IntersectionName)
-		log.Printf("Processing YOLO queue creation from Excel for user %s: intersection %s", user, excelRequest.IntersectionName)
+		excelRequest.IntersectionID = "2"
+
+		log.Printf("Processing YOLO queue creation from Excel for user %s: intersection %s", user, excelRequest.IntersectionID)
 
 		// For Excel files, we need to send both JSON and Excel file
 		if isExcelFile {
-			log.Printf("Sending both JSON and Excel file to simulation endpoint for intersection: %s", excelRequest.IntersectionName)
-
-			// Create JSON file with intersection metadata
-			jsonMetadata := map[string]interface{}{
-				"action":            excelRequest.Action,
-				"intersection_name": excelRequest.IntersectionName,
-				"file_type":         "excel",
-				"timestamp":         time.Now().Unix(),
-			}
-			jsonBytes, err := json.Marshal(jsonMetadata)
-			if err != nil {
-				c.JSON(500, gin.H{"error": "Failed to create JSON metadata"})
-				return
-			}
+			log.Printf("Sending both JSON and Excel file to simulation endpoint for intersection: %s", excelRequest.IntersectionID)
 
 			// Create a new multipart form with both JSON and Excel files
 			var requestBody bytes.Buffer
 			writer := multipart.NewWriter(&requestBody)
 
-			// First, add the JSON file
+			// First, add the original JSON file (use the JSON metadata from frontend)
 			jsonPart, err := writer.CreateFormFile("json_file", "input.json")
 			if err != nil {
 				c.JSON(500, gin.H{"error": "Failed to create JSON form file"})
 				return
 			}
-			if _, err := jsonPart.Write(jsonBytes); err != nil {
+
+			// Create the complete JSON metadata with all required parameters
+			completeJsonMetadata := map[string]interface{}{
+				"intersection_id": excelRequest.IntersectionID,
+				"action":          excelRequest.Action,
+				"algorithm_id":    excelRequest.AlgorithmID,
+				"traffic_load":    excelRequest.TrafficLoad,
+				"queue_algorithm": excelRequest.QueueAlgorithm,
+			}
+
+			completeJsonBytes, err := json.Marshal(completeJsonMetadata)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to marshal complete JSON metadata"})
+				return
+			}
+
+			if _, err := jsonPart.Write(completeJsonBytes); err != nil {
 				c.JSON(500, gin.H{"error": "Failed to write JSON metadata"})
 				return
 			}
@@ -284,10 +326,15 @@ func createIntersectionHandler(c *gin.Context) {
 				return
 			}
 
-			// Return the zip file as response
-			c.Header("Content-Type", "application/zip")
-			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s.zip", fileName))
-			c.Data(200, "application/zip", zipData)
+			// For Excel uploads, return a JSON success response instead of the ZIP file
+			// The ZIP file processing happens on the backend simulation service
+			c.JSON(200, gin.H{
+				"message":         "Excel file processed successfully",
+				"intersection_id": excelRequest.IntersectionID,
+				"filename":        fileName,
+				"status":          "completed",
+				"processed_bytes": len(zipData),
+			})
 			return
 		}
 
@@ -537,6 +584,366 @@ func deleteIntersectionHandler(c *gin.Context) {
 		"intersection_name": intersectionName,
 		"user":              user,
 	})
+}
+
+// linkIntersectionToVideoHandler links an intersection to a video to extract location metadata
+func linkIntersectionToVideoHandler(c *gin.Context) {
+	// Get user from JWT claims
+	claimsI, _ := c.Get("claims")
+	claims := claimsI.(jwt.MapClaims)
+	user := claims["name"].(string)
+
+	var req IntersectionLocationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	if req.IntersectionName == "" || req.VideoKey == "" {
+		c.JSON(400, gin.H{"error": "Both intersection_name and video_key are required"})
+		return
+	}
+
+	// Extract filename from video key (format: user/recordings/filename.ext)
+	parts := strings.Split(req.VideoKey, "/")
+	if len(parts) < 3 || parts[1] != "recordings" {
+		c.JSON(400, gin.H{"error": "Invalid video key format"})
+		return
+	}
+	videoFilename := parts[2]
+
+	// Check if intersection exists
+	intersectionKey := fmt.Sprintf("%s/intersections/%s/config.json", user, req.IntersectionName)
+	getObjOutput, err := s3Client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(intersectionKey),
+	})
+	if err != nil {
+		c.JSON(404, gin.H{"error": "Intersection not found"})
+		return
+	}
+	defer getObjOutput.Body.Close()
+
+	// Read intersection configuration
+	intersectionData, err := io.ReadAll(getObjOutput.Body)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to read intersection configuration"})
+		return
+	}
+
+	// Check if video exists and get its metadata
+	_, err = s3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(req.VideoKey),
+	})
+	if err != nil {
+		c.JSON(404, gin.H{"error": "Video not found"})
+		return
+	}
+
+	// Try to get location data from video metadata first
+	var location *LocationResult
+
+	// Check if location metadata is already stored in the video's S3 metadata
+	headOutput, err := s3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(req.VideoKey),
+	})
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to access video metadata"})
+		return
+	}
+
+	// Check if this video has location metadata (either detected or confirmed)
+	var latitude, longitude, address string
+	var hasLocation bool
+
+	if headOutput.Metadata != nil {
+		// Check for confirmed location first (takes precedence)
+		if lat, exists := headOutput.Metadata["confirmed-latitude"]; exists {
+			if lon, exists := headOutput.Metadata["confirmed-longitude"]; exists {
+				latitude = lat
+				longitude = lon
+				address = headOutput.Metadata["confirmed-address"]
+				hasLocation = true
+			}
+		}
+
+		// If no confirmed location, check for detected location
+		if !hasLocation {
+			if lat, exists := headOutput.Metadata["detected-latitude"]; exists {
+				if lon, exists := headOutput.Metadata["detected-longitude"]; exists {
+					latitude = lat
+					longitude = lon
+					address = headOutput.Metadata["detected-address"]
+					hasLocation = true
+				}
+			}
+		}
+	}
+
+	if !hasLocation {
+		c.JSON(400, gin.H{"error": "Selected video does not have location metadata. Please choose a video with location data."})
+		return
+	}
+
+	// Parse coordinates
+	lat, err1 := strconv.ParseFloat(latitude, 64)
+	lon, err2 := strconv.ParseFloat(longitude, 64)
+
+	if err1 != nil || err2 != nil {
+		c.JSON(500, gin.H{"error": "Invalid location data format in video metadata"})
+		return
+	}
+
+	// Create location object
+	location = &LocationResult{
+		Latitude:  lat,
+		Longitude: lon,
+		Address:   address,
+	}
+
+	// Parse intersection configuration
+	var intersectionRequest IntersectionRequest
+	if err := json.Unmarshal(intersectionData, &intersectionRequest); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to parse intersection configuration"})
+		return
+	}
+
+	// Update intersection with location data
+	intersectionRequest.Intersection.Latitude = &location.Latitude
+	intersectionRequest.Intersection.Longitude = &location.Longitude
+	intersectionRequest.Intersection.Address = &location.Address
+
+	// Save updated intersection configuration
+	updatedIntersectionJSON, err := json.Marshal(intersectionRequest)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to serialize updated intersection"})
+		return
+	}
+
+	// Create metadata with intersection details including location
+	metadata := make(map[string]string)
+	metadata["intersection_id"] = intersectionRequest.Intersection.ID
+	metadata["intersection_name"] = intersectionRequest.Intersection.Name
+	metadata["user"] = user
+	metadata["latitude"] = fmt.Sprintf("%f", location.Latitude)
+	metadata["longitude"] = fmt.Sprintf("%f", location.Longitude)
+	metadata["address"] = location.Address
+	metadata["linked_video"] = videoFilename
+
+	// Store direction codes as comma-separated string
+	var directionCodes []string
+	for _, dir := range intersectionRequest.Directions {
+		directionCodes = append(directionCodes, dir.Code)
+	}
+	metadata["direction_codes"] = strings.Join(directionCodes, ",")
+	metadata["direction_count"] = fmt.Sprintf("%d", len(intersectionRequest.Directions))
+	metadata["phase_count"] = fmt.Sprintf("%d", len(intersectionRequest.Phases))
+
+	_, err = s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(intersectionKey),
+		Body:        strings.NewReader(string(updatedIntersectionJSON)),
+		ContentType: aws.String("application/json"),
+		Metadata:    metadata,
+	})
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to update intersection with location data"})
+		return
+	}
+
+	log.Printf("Intersection %s linked to video %s with location data (lat: %f, lon: %f)",
+		req.IntersectionName, videoFilename, location.Latitude, location.Longitude)
+
+	c.JSON(200, gin.H{
+		"message":           "Intersection successfully linked to video location",
+		"intersection_name": req.IntersectionName,
+		"video_key":         req.VideoKey,
+		"video_filename":    videoFilename,
+		"location": map[string]interface{}{
+			"latitude":  location.Latitude,
+			"longitude": location.Longitude,
+			"address":   location.Address,
+		},
+	})
+}
+
+// listIntersectionsWithLocationHandler returns all intersections with location data for map display
+func listIntersectionsWithLocationHandler(c *gin.Context) {
+	// Get user from JWT claims
+	claimsI, _ := c.Get("claims")
+	claims := claimsI.(jwt.MapClaims)
+	user := claims["name"].(string)
+
+	// List all intersections for this user
+	intersectionsPrefix := fmt.Sprintf("%s/intersections/", user)
+	listOutput, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(intersectionsPrefix),
+	})
+
+	if err != nil {
+		log.Printf("Failed to list intersections for user %s: %v", user, err)
+		c.JSON(500, gin.H{"error": "Failed to list intersections"})
+		return
+	}
+
+	var intersectionsWithLocation []IntersectionWithLocation
+
+	for _, obj := range listOutput.Contents {
+		// Only process config.json files
+		if !strings.HasSuffix(*obj.Key, "/config.json") {
+			continue
+		}
+
+		// Get object metadata
+		headOutput, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    obj.Key,
+		})
+
+		if err != nil {
+			log.Printf("Failed to get metadata for %s: %v", *obj.Key, err)
+			continue
+		}
+
+		// Check if this intersection has location data
+		metadata := headOutput.Metadata
+		if lat, exists := metadata["latitude"]; exists {
+			if lon, exists := metadata["longitude"]; exists {
+				latitude, err1 := strconv.ParseFloat(lat, 64)
+				longitude, err2 := strconv.ParseFloat(lon, 64)
+
+				if err1 == nil && err2 == nil {
+					intersection := IntersectionWithLocation{
+						ID:        metadata["intersection_id"],
+						Name:      metadata["intersection_name"],
+						Latitude:  latitude,
+						Longitude: longitude,
+						Address:   metadata["address"],
+						UserName:  user,
+					}
+					intersectionsWithLocation = append(intersectionsWithLocation, intersection)
+				}
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"intersections": intersectionsWithLocation,
+		"count":         len(intersectionsWithLocation),
+	})
+}
+
+// listRecordingsWithLocation returns all recordings that have location metadata
+func listRecordingsWithLocation(c *gin.Context) {
+	// Get user from JWT claims
+	claimsI, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "claims not found in context"})
+		return
+	}
+
+	claims, ok := claimsI.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid claims data"})
+		return
+	}
+
+	userName, ok := claims["name"].(string)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user name not found in claims"})
+		return
+	}
+
+	ctx := context.TODO()
+	userRecordingsPrefix := userName + "/recordings/"
+
+	// List all objects in the user's recordings folder
+	output, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(userRecordingsPrefix),
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list recordings"})
+		return
+	}
+
+	// Check each recording for location metadata
+	var recordingsWithLocation []map[string]interface{}
+
+	for _, obj := range output.Contents {
+		// Skip "folders" and thumbnail files
+		if strings.HasSuffix(*obj.Key, "/") || strings.Contains(*obj.Key, ".thumbnail.") {
+			continue
+		}
+
+		// Get object metadata to check for location data
+		headOutput, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    obj.Key,
+		})
+
+		if err != nil {
+			continue // Skip if we can't get metadata
+		}
+
+		// Check if this recording has location metadata (either detected or confirmed)
+		var latitude, longitude, address string
+		var hasLocation bool
+
+		if headOutput.Metadata != nil {
+			// Check for confirmed location first (takes precedence)
+			if lat, exists := headOutput.Metadata["confirmed-latitude"]; exists {
+				if lon, exists := headOutput.Metadata["confirmed-longitude"]; exists {
+					latitude = lat
+					longitude = lon
+					address = headOutput.Metadata["confirmed-address"]
+					hasLocation = true
+				}
+			}
+
+			// If no confirmed location, check for detected location
+			if !hasLocation {
+				if lat, exists := headOutput.Metadata["detected-latitude"]; exists {
+					if lon, exists := headOutput.Metadata["detected-longitude"]; exists {
+						latitude = lat
+						longitude = lon
+						address = headOutput.Metadata["detected-address"]
+						hasLocation = true
+					}
+				}
+			}
+		}
+
+		if hasLocation {
+			// Parse coordinates
+			lat, err1 := strconv.ParseFloat(latitude, 64)
+			lon, err2 := strconv.ParseFloat(longitude, 64)
+
+			if err1 == nil && err2 == nil {
+				filename := strings.TrimPrefix(*obj.Key, userRecordingsPrefix)
+
+				recordingDetail := map[string]interface{}{
+					"recording_key": *obj.Key,
+					"filename":      filename,
+					"latitude":      lat,
+					"longitude":     lon,
+					"address":       address,
+					"upload_time":   obj.LastModified,
+					"size":          *obj.Size,
+				}
+
+				recordingsWithLocation = append(recordingsWithLocation, recordingDetail)
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, recordingsWithLocation)
 }
 
 // sendToSimulationEndpoint sends the JSON data to the external simulation endpoint
