@@ -282,7 +282,7 @@ func createIntersectionHandler(c *gin.Context) {
 
 		// Create the complete JSON structure expected by the simulation endpoint
 		completeAnalysisJSON := map[string]interface{}{
-			"intersection_id": analysisRequest.IntersectionID, // Mock data for now
+			"intersection_id": 22, // Mock data for now
 			"algorithm_id":    1,
 			"algorithm_id2":   2,
 			"algorithm_id3":   4,
@@ -292,6 +292,20 @@ func createIntersectionHandler(c *gin.Context) {
 			"yellow_time":     3, // Mock data
 			"train_episodes":  0, // Mock data
 			"eval_every":      0, // Mock data
+		}
+
+		if genericRequest.Action == "Show_time_changes" {
+			log.Println("QUEUE LOAD ACTION DETECTED")
+			completeAnalysisJSON = map[string]interface{}{
+				"intersection_id": 22,
+				"algorithm_id":    2,
+				"traffic_load":    2,
+				"queue_algorithm": 2,
+				"action":          "Show_time_changes",
+				"yellow_time":     3,
+				"train_episodes":  500,
+				"eval_every":      10,
+			}
 		}
 
 		if genericRequest.Action == "Show_queue_load" {

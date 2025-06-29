@@ -416,11 +416,11 @@ func landingHandler(c *gin.Context) {
 }
 
 func uploadHandler(c *gin.Context) {
-	// Allow up to 100MB uploads
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 100<<20) // 100MB
-	if err := c.Request.ParseMultipartForm(100 << 20); err != nil {
+	// Allow up to 200MB uploads
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 200<<20) // 200MB
+	if err := c.Request.ParseMultipartForm(200 << 20); err != nil {
 		if strings.Contains(err.Error(), "http: request body too large") {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "File too large. Maximum allowed size is 100MB."})
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "File too large. Maximum allowed size is 200MB."})
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse multipart form: " + err.Error()})
@@ -1795,13 +1795,15 @@ func main() {
 		authorized.DELETE("/users/me/recordings", deleteMyRecording)                         // New
 		authorized.POST("/upload", uploadHandler)                                            // YOLO proxy routes
 		authorized.POST("/detect-location", detectLocationHandler)                           // Location detection endpoint
-		authorized.POST("/save-video-location", saveVideoLocationHandler)                    // Save video location endpoint
-		// YOLO proxy routes
+		authorized.POST("/save-video-location", saveVideoLocationHandler)                    // Save video location endpoint		// YOLO proxy routes
 		authorized.POST("/yolo/upload", uploadVideoToYOLO)
 		authorized.POST("/yolo/process", processVideoWithYOLO)
 		authorized.GET("/yolo/status/:task_id", getYOLOTaskStatus)
 		authorized.GET("/yolo/download/:file_id", downloadYOLOResults)
 		authorized.HEAD("/yolo/download/:file_id", downloadYOLOResults) // Support HEAD requests for status checking
+
+		// New S3 direct processing route - no size limits!
+		authorized.POST("/yolo/process-s3", processVideoFromS3)
 
 		// Admin routes
 		admin := authorized.Group("/")
