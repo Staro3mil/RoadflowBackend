@@ -1761,6 +1761,7 @@ func main() {
 			"http://localhost:5000",
 			"https://roadflow.motorcycles",
 			"https://processingflaskapp-49638678323.europe-central2.run.app",
+			"https://peaceful-dragon-66b0be.netlify.app",
 		},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
